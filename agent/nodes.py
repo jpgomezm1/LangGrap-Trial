@@ -18,7 +18,7 @@ llm = ChatGoogleGenerativeAI(
     model=config.MODEL_NAME,
     google_api_key=config.GOOGLE_API_KEY,
     temperature=0.3,  # Reducido para ser más consistente
-    max_tokens=300,   # Reducido para ahorrar tokens
+    max_tokens=300,  # Reducido para ahorrar tokens
 )
 
 # Inicializar servicio de email
@@ -49,28 +49,32 @@ def safe_llm_invoke(prompt, max_retries=3):
     
     raise Exception("Se agotaron los reintentos para el LLM")
 
-def extract_info_simple(message):
-    """Extracción simple de información sin usar LLM"""
+def extract_info_advanced(message: str) -> dict:
+    """
+    Extracción avanzada de información con mejor detección de patrones
+    """
     message_lower = message.lower()
     extracted = {
         "user_name": None,
         "company_name": None,
         "phone": None,
         "email": None,
-        "rut_text": None,
         "project_details": {
             "height": None,
             "duration_text": None,
+            "duration_number": None,
             "work_type": None
         }
     }
     
-    # Buscar alturas (números seguidos de "metros", "m", "pisos", "plantas")
+    # Mejorar detección de altura
     height_patterns = [
-        r'(\d+)\s*(?:metros?|m\b)',
-        r'(\d+)\s*(?:pisos?|plantas?)',
+        r'(\d+)\s*(?:metros?|m\b|mts?)',
+        r'(\d+)\s*(?:pisos?|plantas?|niveles?)',
         r'altura.*?(\d+)',
-        r'(\d+)\s*(?:de altura|alto)'
+        r'(\d+)\s*(?:de altura|alto)',
+        r'hasta.*?(\d+)\s*(?:metros?|m\b)',
+        r'(\d+)\s*(?:metros?|m\b).*?(?:altura|alto)'
     ]
     
     for pattern in height_patterns:
@@ -78,50 +82,135 @@ def extract_info_simple(message):
         if match:
             try:
                 height = int(match.group(1))
-                if height > 50:  # Si es muy alto, probablemente sean plantas
-                    height = height * 3  # Aproximadamente 3m por planta
-                extracted["project_details"]["height"] = height
-                break
+                # Si menciona pisos/plantas, convertir a metros (aprox 3m por piso)
+                if any(word in pattern for word in ['pisos', 'plantas', 'niveles']):
+                    height = height * 3
+                # Validar altura razonable (entre 1 y 100 metros)
+                if 1 <= height <= 100:
+                    extracted["project_details"]["height"] = height
+                    break
             except:
-                pass
+                continue
     
-    # Buscar duración
+    # Mejorar detección de duración
     duration_patterns = [
-        r'(\d+)\s*(?:días?|day)',
-        r'(\d+)\s*(?:semanas?|week)',
-        r'(\d+)\s*(?:meses?|month)',
-        r'(\d+)\s*(?:años?|year)'
+        (r'(\d+)\s*(?:días?|day)', 'días'),
+        (r'(\d+)\s*(?:semanas?|week)', 'semanas'),
+        (r'(\d+)\s*(?:meses?|month)', 'meses'),
+        (r'(\d+)\s*(?:años?|year)', 'años'),
+        (r'una?\s*(?:semana|week)', '1 semana'),
+        (r'un?\s*(?:mes|month)', '1 mes'),
+        (r'varios?\s*(?:días?|day)', 'varios días'),
+        (r'algunas?\s*(?:semanas?|week)', 'algunas semanas')
     ]
     
-    for pattern in duration_patterns:
+    for pattern, unit in duration_patterns:
         match = re.search(pattern, message_lower)
         if match:
-            extracted["project_details"]["duration_text"] = match.group(0)
+            try:
+                if 'varios' in pattern or 'algunas' in pattern:
+                    extracted["project_details"]["duration_text"] = unit
+                    extracted["project_details"]["duration_number"] = 7  # Default
+                else:
+                    number = int(match.group(1))
+                    extracted["project_details"]["duration_text"] = f"{number} {unit}"
+                    extracted["project_details"]["duration_number"] = number
+                break
+            except:
+                continue
+    
+    # Mejorar detección de tipo de trabajo
+    work_types = {
+        'construcción': ['construc', 'obra', 'build', 'edificar', 'levantar'],
+        'mantenimiento': ['manten', 'repair', 'reparar', 'arreglar', 'revisar'],
+        'limpieza': ['limpi', 'clean', 'lavar', 'limpiar'],
+        'pintura': ['pintu', 'paint', 'pintar'],
+        'instalación': ['instal', 'montar', 'colocar', 'poner'],
+        'soldadura': ['sold', 'weld', 'soldar'],
+        'electricidad': ['eléctric', 'electric', 'cableado', 'cables'],
+        'plomería': ['plomer', 'tubería', 'pipes', 'agua'],
+        'techos': ['techo', 'roof', 'cubierta', 'tejado'],
+        'fachada': ['fachada', 'facade', 'exterior', 'muro']
+    }
+    
+    for work_type, keywords in work_types.items():
+        if any(keyword in message_lower for keyword in keywords):
+            extracted["project_details"]["work_type"] = work_type
             break
     
-    # Buscar tipo de trabajo
-    if any(word in message_lower for word in ['limpi', 'clean']):
-        extracted["project_details"]["work_type"] = "limpieza"
-    elif any(word in message_lower for word in ['manten', 'repair']):
-        extracted["project_details"]["work_type"] = "mantenimiento"
-    elif any(word in message_lower for word in ['construc', 'build']):
-        extracted["project_details"]["work_type"] = "construcción"
-    elif any(word in message_lower for word in ['pintu', 'paint']):
-        extracted["project_details"]["work_type"] = "pintura"
+    # Detección de nombres (mejorada)
+    name_patterns = [
+        r'(?:soy|me llamo|mi nombre es)\s+([A-ZÁÉÍÓÚ][a-záéíóú]+(?:\s+[A-ZÁÉÍÓÚ][a-záéíóú]+)*)',
+        r'([A-ZÁÉÍÓÚ][a-záéíóú]+)\s+(?:de|desde|en)\s+(?:la\s+)?(?:empresa|compañía)',
+        r'buenos?\s+días?,?\s+soy\s+([A-ZÁÉÍÓÚ][a-záéíóú]+(?:\s+[A-ZÁÉÍÓÚ][a-záéíóú]+)*)'
+    ]
     
-    # Buscar emails
+    for pattern in name_patterns:
+        match = re.search(pattern, message)
+        if match:
+            name = match.group(1).strip()
+            if len(name.split()) <= 3:  # Máximo 3 palabras para un nombre
+                extracted["user_name"] = name
+                break
+    
+    # Detección de empresa (mejorada)
+    company_patterns = [
+        r'(?:empresa|compañía|constructora|grupo)\s+([A-ZÁÉÍÓÚ][A-Za-záéíóú\s]+)',
+        r'([A-ZÁÉÍÓÚ][A-Za-záéíóú\s]+)\s+(?:S\.?A\.?S?|LTDA|SAS|CIA)',
+        r'de\s+([A-ZÁÉÍÓÚ][A-Za-záéíóú\s]+?)(?:\s+S\.?A\.?S?|\s+LTDA|\s+SAS|$)',
+        r'trabajo\s+para\s+([A-ZÁÉÍÓÚ][A-Za-záéíóú\s]+)'
+    ]
+    
+    for pattern in company_patterns:
+        match = re.search(pattern, message)
+        if match:
+            company = match.group(1).strip()
+            if 3 <= len(company) <= 50:  # Longitud razonable para nombre de empresa
+                extracted["company_name"] = company
+                break
+    
+    # Emails y teléfonos
     email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
     email_match = re.search(email_pattern, message)
     if email_match:
         extracted["email"] = email_match.group(0)
     
-    # Buscar teléfonos
     phone_pattern = r'(?:\+57\s?)?(?:3\d{2}|[1-8]\d{2})\s?\d{3}\s?\d{4}'
     phone_match = re.search(phone_pattern, message)
     if phone_match:
         extracted["phone"] = phone_match.group(0)
     
     return extracted
+
+def extract_equipment_selection(message: str, equipment_list: list) -> int:
+    """Extrae qué equipo seleccionó el usuario del mensaje"""
+    message_lower = message.lower()
+    
+    # Buscar números explícitos
+    numbers = re.findall(r'\b(\d+)\b', message)
+    for num in numbers:
+        index = int(num) - 1  # Convertir a índice base 0
+        if 0 <= index < len(equipment_list):
+            return index
+    
+    # Buscar palabras ordinales
+    ordinals = {
+        'primer': 0, 'primera': 0, 'uno': 0,
+        'segundo': 1, 'segunda': 1, 'dos': 1,
+        'tercer': 2, 'tercera': 2, 'tres': 2
+    }
+    
+    for word, index in ordinals.items():
+        if word in message_lower and index < len(equipment_list):
+            return index
+    
+    # Si menciona características específicas, buscar coincidencia
+    for i, equipment in enumerate(equipment_list):
+        equipment_name = equipment.get('name', '').lower()
+        if any(word in equipment_name for word in message_lower.split() if len(word) > 3):
+            return i
+    
+    return None
 
 def generate_response(template_name: str, context: dict) -> str:
     """Función utilitaria para generar respuestas consistentes"""
@@ -155,75 +244,508 @@ Esto me ayudará a recomendarte la mejor opción. 😊""",
 
 def router_node(state: AgentState) -> AgentState:
     """
-    Nodo central de enrutamiento optimizado con lógica más simple.
+    Router completamente basado en AI que maneja toda la lógica conversacional.
     """
-    print("---ROUTER NODE---")
+    print("---ROUTER AI NODE---")
     messages = state['messages']
     
     if not messages:
         state["next_node"] = "consultation"
-        logger.info("Router: Sin mensajes, comenzando consulta")
+        logger.info("Router AI: Sin mensajes, comenzando consulta")
         return state
     
-    last_message = messages[-1].content.lower()
-
-    # --- Lógica de enrutamiento explícita y priorizada ---
-
-    # 1. Si acabamos de recibir un documento, debemos procesarlo.
-    if state.get("document_path") and not state.get("client_info"):
-        state["next_node"] = "process_rut"
-        logger.info("Router: Documento recibido, procesando RUT")
-        return state
-    
-    # 2. Si el usuario pide cotización y ya tenemos equipo seleccionado
-    if ("cotiza" in last_message or "cotización" in last_message or "precio" in last_message) and state.get('selected_equipment'):
-        # Si aún no tenemos info del cliente, la pedimos
-        if not state.get('client_info'):
-            state["next_node"] = "collect_documents"
-            logger.info("Router: Cotización solicitada, recolectando documentos")
-        else: # Si ya la tenemos, generamos la cotización
-            state["next_node"] = "generate_quotation"
-            logger.info("Router: Generando cotización")
-        return state
-
-    # 3. Si ya se generó el PDF, lo enviamos.
-    if state.get("quotation_pdf_path"):
-        state["next_node"] = "send_quotation"
-        logger.info("Router: PDF listo, enviando cotización")
-        return state
-
-    # 4. Si el último mensaje es del asistente, esperar
+    # Si el último mensaje es del asistente, esperar respuesta del usuario
     if len(messages) > 0 and isinstance(messages[-1], AIMessage):
         state["next_node"] = "END"
-        logger.info("Router: Esperando respuesta del cliente")
+        logger.info("Router AI: Esperando respuesta del cliente")
+        return state
+    
+    # Casos críticos que requieren acción inmediata (no AI)
+    if state.get("document_path") and not state.get("client_info"):
+        state["next_node"] = "process_rut"
+        logger.info("Router AI: Documento recibido, procesando RUT")
+        return state
+    
+    if state.get("quotation_pdf_path"):
+        state["next_node"] = "send_quotation"
+        logger.info("Router AI: PDF listo, enviando cotización")
+        return state
+    
+    # USAR AI INTELIGENTE PARA TODA LA LÓGICA CONVERSACIONAL
+    try:
+        intention = classify_conversation_intelligently(messages[-1].content, state)
+        state["next_node"] = intention
+        logger.info(f"Router AI: Decisión inteligente - {intention}")
+        print(f"🧠 AI decidió: {intention}")
+        return state
+        
+    except Exception as e:
+        logger.error(f"Error en Router AI: {e}")
+        state["next_node"] = "consultation"
+        logger.info("Router AI: Fallback seguro a consultation")
         return state
 
-    # 5. Si tenemos suficiente información del proyecto, analizar
+def classify_conversation_intelligently(message: str, state: AgentState) -> str:
+    """
+    Clasificador AI avanzado que entiende el contexto completo de la conversación.
+    """
+    
+    # Contexto rico del estado actual
     project_details = state.get('project_details', {})
-    if project_details.get('height') and project_details.get('work_type'):
-        state["next_node"] = "analyze_requirements"
-        logger.info("Router: Información completa, analizando requisitos")
-        return state
+    has_recommendations = bool(state.get('recommended_equipment'))
+    has_client_info = bool(state.get('client_info'))
+    conversation_stage = state.get('conversation_stage', 'welcome')
+    user_name = state.get('user_name', 'Usuario')
+    company_name = state.get('company_name', 'No especificada')
+    
+    # Información de equipos disponibles
+    recommendations_summary = ""
+    if has_recommendations:
+        equipment_names = [eq.get('name', 'Equipo') for eq in state.get('recommended_equipment', [])]
+        recommendations_summary = f"Equipos ya recomendados: {', '.join(equipment_names)}"
+    
+    # Prompt súper inteligente para Gemini
+    classification_prompt = f"""Eres un router inteligente para un chatbot experto en alquiler de equipos de altura. Tu trabajo es decidir el siguiente paso en la conversación basado en el contexto completo.
 
-    # 6. Por defecto, seguir en consulta
-    state["next_node"] = "consultation"
-    logger.info("Router: Continuando consulta")
+MENSAJE DEL USUARIO: "{message}"
+
+CONTEXTO COMPLETO DE LA CONVERSACIÓN:
+- Usuario: {user_name} de {company_name}
+- Etapa actual: {conversation_stage}
+- Altura necesaria: {project_details.get('height', 'No especificada')}
+- Tipo de trabajo: {project_details.get('work_type', 'No especificado')}
+- Duración proyecto: {project_details.get('duration_text', 'No especificada')}
+- ¿Ya recomendamos equipos?: {has_recommendations}
+- {recommendations_summary}
+- ¿Tenemos datos del cliente?: {has_client_info}
+- Email: {state.get('email', 'No')}
+- Teléfono: {state.get('phone', 'No')}
+
+OPCIONES DE NODOS:
+1. "company_info" - Usuario pregunta sobre nuestra empresa, servicios, ubicación, experiencia, horarios, contacto
+2. "equipment_details" - Usuario pregunta detalles técnicos, funcionamiento, seguridad, capacitación de equipos específicos
+3. "analyze_requirements" - Tenemos info COMPLETA del proyecto (altura + trabajo + duración) pero NO hemos recomendado equipos
+4. "collect_documents" - Usuario pide cotización pero nos faltan datos (teléfono, email, RUT)
+5. "generate_quotation" - Usuario pide cotización y tenemos TODOS los datos necesarios
+6. "consultation" - Necesitamos más info del proyecto, usuario se presenta, o conversación general
+
+REGLAS DE DECISIÓN INTELIGENTE:
+
+🏢 EMPRESA: Si pregunta sobre nosotros/servicios/ubicación/experiencia → "company_info"
+Ejemplos: "¿Quiénes son?", "¿Qué servicios ofrecen?", "¿Dónde están ubicados?"
+
+🔧 EQUIPOS: Si pregunta detalles técnicos de equipos ya mencionados → "equipment_details"  
+Ejemplos: "¿Cómo funciona el elevador?", "¿Qué capacitación incluye?", "¿Es seguro?"
+
+📋 ANÁLISIS: Si tenemos altura + trabajo + duración pero NO equipos → "analyze_requirements"
+Solo usar si: altura ≠ null AND work_type ≠ null AND duration_text ≠ null AND no equipos recomendados
+
+💰 COTIZACIÓN SIN DATOS: Si pide precio pero falta email/teléfono → "collect_documents"
+Ejemplos: "Quiero cotización" pero no tenemos contacto completo
+
+💰 COTIZACIÓN COMPLETA: Si pide precio y tenemos todo → "generate_quotation" 
+Solo si: equipos recomendados + email + teléfono + datos cliente
+
+🗣️ CONSULTA: Todo lo demás (presentaciones, más info proyecto, conversación general)
+Ejemplos: "Soy Juan de...", "Necesito para 20 metros", "Trabajo de limpieza"
+
+ANÁLISIS CONTEXTUAL:
+- Si dice "me interesa la opción X" → "equipment_details" (quiere saber más del equipo)
+- Si dice "perfecto, procedamos" → "collect_documents" or "generate_quotation" 
+- Si da altura en pisos → "consultation" (convertir y confirmar)
+- Si menciona presupuesto/precio/cotización → evaluar si tenemos datos completos
+
+RESPONDE SOLO con UNA de estas 6 opciones exactas:
+company_info, equipment_details, analyze_requirements, collect_documents, generate_quotation, consultation"""
+
+    try:
+        rate_limit_delay()
+        
+        # Usar configuración optimizada para clasificación
+        classification_llm = ChatGoogleGenerativeAI(
+            model="gemini-1.5-flash",
+            google_api_key=config.GOOGLE_API_KEY,
+            temperature=0.05,  # Muy bajo para máxima consistencia
+            max_tokens=20      # Solo necesitamos la clasificación
+        )
+        
+        response = classification_llm.invoke(classification_prompt)
+        intention = response.content.strip().lower()
+        
+        # Limpiar respuesta y validar
+        valid_intentions = [
+            "company_info", "equipment_details", "analyze_requirements",
+            "collect_documents", "generate_quotation", "consultation"
+        ]
+        
+        # Buscar coincidencia exacta o parcial
+        for valid_intention in valid_intentions:
+            if valid_intention in intention:
+                logger.info(f"🧠 AI clasificó: {valid_intention}")
+                print(f"🎯 Decisión AI: {valid_intention}")
+                return valid_intention
+        
+        # Si no encuentra una válida, analizar contexto para fallback inteligente
+        logger.warning(f"🤔 AI respuesta unclear: '{intention}', analizando contexto...")
+        return intelligent_fallback(message, state)
+            
+    except Exception as e:
+        logger.error(f"💥 Error en AI classification: {e}")
+        return intelligent_fallback(message, state)
+
+def intelligent_fallback(message: str, state: AgentState) -> str:
+    """
+    Fallback inteligente basado en contexto cuando AI falla.
+    """
+    message_lower = message.lower()
+    project_details = state.get('project_details', {})
+    
+    # Análisis contextual inteligente
+    
+    # 1. Preguntas claramente sobre empresa
+    company_signals = ['empresa', 'quienes', 'donde', 'ubicacion', 'servicios', 'experiencia', 'años', 'contacto', 'horarios']
+    if any(signal in message_lower for signal in company_signals):
+        logger.info("🎯 Fallback: Detectada pregunta empresa")
+        return "company_info"
+    
+    # 2. Info completa de proyecto → analizar
+    has_complete_project = (
+        project_details.get('height') and 
+        project_details.get('work_type') and 
+        project_details.get('duration_text')
+    )
+    
+    if has_complete_project and not state.get('recommended_equipment'):
+        logger.info("🎯 Fallback: Proyecto completo, analizar requisitos")
+        return "analyze_requirements"
+    
+    # 3. Solicitud de cotización
+    quotation_signals = ['cotiza', 'precio', 'costo', 'presupuesto', 'cuanto', 'valor']
+    if any(signal in message_lower for signal in quotation_signals):
+        if state.get('recommended_equipment'):
+            if state.get('email') and state.get('phone'):
+                logger.info("🎯 Fallback: Cotización con datos completos")
+                return "generate_quotation"
+            else:
+                logger.info("🎯 Fallback: Cotización sin datos cliente")
+                return "collect_documents"
+        else:
+            logger.info("🎯 Fallback: Cotización sin equipos, más info")
+            return "consultation"
+    
+    # 4. Preguntas sobre equipos ya recomendados
+    equipment_signals = ['funciona', 'caracteristicas', 'seguridad', 'capacitacion', 'especificaciones']
+    if any(signal in message_lower for signal in equipment_signals) and state.get('recommended_equipment'):
+        logger.info("🎯 Fallback: Pregunta sobre equipos")
+        return "equipment_details"
+    
+    # 5. Por defecto: continuar conversación
+    logger.info("🎯 Fallback: Conversación general")
+    return "consultation"
+
+def classify_user_intention(message: str, state: AgentState) -> str:
+    """
+    Usa Gemini para clasificar la intención del usuario y decidir el siguiente nodo.
+    """
+    
+    # Contexto del estado actual
+    project_details = state.get('project_details', {})
+    has_recommendations = bool(state.get('recommended_equipment'))
+    has_client_info = bool(state.get('client_info'))
+    conversation_stage = state.get('conversation_stage', 'welcome')
+    
+    # Prompt mejorado y más específico
+    classification_prompt = f"""Clasifica la intención del usuario en un chatbot de alquiler de equipos de altura.
+
+MENSAJE DEL USUARIO: "{message}"
+
+CONTEXTO:
+- Etapa de conversación: {conversation_stage}
+- Proyecto definido: {bool(project_details)}
+- Tiene recomendaciones de equipos: {has_recommendations}
+- Información del cliente recopilada: {has_client_info}
+
+CLASIFICACIONES POSIBLES:
+1. "company_info" - Usuario PREGUNTA sobre nuestra empresa (¿quiénes son?, ¿dónde están?, ¿qué servicios ofrecen?, etc.)
+2. "equipment_details" - Usuario pregunta detalles técnicos sobre equipos específicos
+3. "collect_documents" - Usuario solicita cotización pero nos falta información del cliente
+4. "generate_quotation" - Usuario solicita cotización y ya tenemos toda la información
+5. "analyze_requirements" - Tenemos información completa del proyecto pero no hemos recomendado equipos
+6. "consultation" - Usuario se presenta, da información del proyecto, o conversación general
+
+REGLAS IMPORTANTES:
+- Si el usuario se PRESENTA o da su información personal → "consultation"
+- Si el usuario PREGUNTA sobre nosotros/empresa → "company_info"
+- Si habla de su proyecto/necesidades → "consultation"
+- Si pide cotización explícitamente → "collect_documents" o "generate_quotation"
+
+EJEMPLOS:
+- "Soy Juan de Constructora ABC" → consultation
+- "¿Quiénes son ustedes?" → company_info
+- "Necesito equipos para 15 metros" → consultation
+- "Quiero una cotización" → collect_documents
+
+RESPONDE SOLO con una de las 6 clasificaciones exactas."""
+
+    try:
+        rate_limit_delay()
+        
+        classification_llm = ChatGoogleGenerativeAI(
+            model="gemini-1.5-flash",
+            google_api_key=config.GOOGLE_API_KEY,
+            temperature=0.1,  # Muy bajo para consistencia
+            max_tokens=15     # Un poco más para asegurar respuesta completa
+        )
+        
+        response = classification_llm.invoke(classification_prompt)
+        intention = response.content.strip().lower()
+        
+        # Limpiar respuesta (a veces Gemini agrega texto extra)
+        valid_intentions = [
+            "company_info", "equipment_details", "collect_documents",
+            "generate_quotation", "analyze_requirements", "consultation"
+        ]
+        
+        # Buscar si alguna clasificación válida está en la respuesta
+        for valid_intention in valid_intentions:
+            if valid_intention in intention:
+                logger.info(f"AI clasificó: {valid_intention}")
+                return valid_intention
+        
+        # Si no encuentra una válida, default a consultation
+        logger.warning(f"Clasificación no reconocida: '{intention}', usando consultation")
+        return "consultation"
+            
+    except Exception as e:
+        logger.error(f"Error clasificación AI: {e}")
+        return "consultation"
+
+def company_info_node(state: AgentState) -> AgentState:
+    """
+    Nodo para responder preguntas sobre la empresa
+    """
+    print("---COMPANY INFO NODE---")
+    
+    last_message = state.get('current_message', '').lower()
+    
+    # Información base de la empresa
+    company_responses = {
+        'ubicación': f"Estamos ubicados en Bogotá, Colombia. Hacemos entregas en toda la ciudad y alrededores.",
+        'contacto': f"Puedes contactarnos al {config.COMPANY_PHONE} o por email a {config.COMPANY_EMAIL}",
+        'horarios': "Atendemos de lunes a viernes de 7:00 AM a 6:00 PM, y sábados de 8:00 AM a 2:00 PM",
+        'experiencia': f"{config.COMPANY_NAME} cuenta con más de 10 años de experiencia en alquiler de equipos de altura",
+        'servicios': "Ofrecemos alquiler de andamios, elevadores, escaleras y equipos especializados para trabajo en altura",
+        'seguridad': "Todos nuestros equipos cumplen con las normas de seguridad colombianas y vienen con capacitación incluida"
+    }
+    
+    # Detectar qué información específica busca
+    response = None
+    for keyword, info in company_responses.items():
+        if keyword in last_message:
+            response = info
+            break
+    
+    if not response:
+        # Respuesta general sobre la empresa
+        response = f"""¡Claro! Te cuento sobre {config.COMPANY_NAME}:
+
+🏗️ **Somos especialistas en equipos de altura** con más de 10 años de experiencia
+📍 **Ubicación**: Bogotá, Colombia (entregas en toda la ciudad)
+⏰ **Horarios**: Lunes a viernes 7AM-6PM, sábados 8AM-2PM
+📞 **Contacto**: {config.COMPANY_PHONE}
+📧 **Email**: {config.COMPANY_EMAIL}
+
+**Nuestros servicios incluyen:**
+✅ Alquiler de andamios multidireccionales
+✅ Elevadores tijera y articulados  
+✅ Escaleras telescópicas y extensibles
+✅ Capacitación en seguridad incluida
+✅ Entrega y recogida sin costo adicional en Bogotá
+✅ Soporte técnico 24/7
+
+¿Te gustaría que te ayude a encontrar el equipo perfecto para tu proyecto? 😊"""
+
+    state['response'] = response
+    logger.info("Información de empresa proporcionada")
+    return state
+
+def equipment_details_node(state: AgentState) -> AgentState:
+    """
+    Nodo para proporcionar detalles específicos sobre equipos
+    """
+    print("---EQUIPMENT DETAILS NODE---")
+    
+    last_message = state.get('current_message', '').lower()
+    selected_equipment = state.get('selected_equipment')
+    recommended_equipment = state.get('recommended_equipment', [])
+    
+    if not selected_equipment and recommended_equipment:
+        selected_equipment = recommended_equipment[0]  # Usar el primero por defecto
+    
+    if not selected_equipment:
+        state['response'] = "¿Sobre qué equipo te gustaría conocer más detalles?"
+        return state
+    
+    # Detectar qué tipo de información busca
+    detail_type = None
+    if any(word in last_message for word in ['funciona', 'opera', 'maneja']):
+        detail_type = 'operation'
+    elif any(word in last_message for word in ['seguridad', 'riesgo', 'protección']):
+        detail_type = 'safety'
+    elif any(word in last_message for word in ['especificaciones', 'características', 'técnico']):
+        detail_type = 'specs'
+    elif any(word in last_message for word in ['entrega', 'instalación', 'montaje']):
+        detail_type = 'delivery'
+    elif any(word in last_message for word in ['capacitación', 'entrenamiento', 'curso']):
+        detail_type = 'training'
+    
+    equipment_name = selected_equipment.get('name', 'el equipo seleccionado')
+    
+    if detail_type == 'operation':
+        response = f"""🔧 **¿Cómo funciona el {equipment_name}?**
+
+{selected_equipment.get('description', 'Equipo profesional para trabajo en altura')}
+
+**Características de operación:**
+- Altura máxima: {selected_equipment.get('max_height', 'N/A')} metros
+- Capacidad de carga: {selected_equipment.get('specifications', {}).get('peso_max', 'Según especificaciones')}
+- Tipo de tracción: {selected_equipment.get('specifications', {}).get('tipo', 'Manual/Eléctrico')}
+
+**Casos de uso ideales:**
+{chr(10).join([f"• {use_case.title()}" for use_case in selected_equipment.get('use_cases', ['Trabajo en altura general'])])}
+
+¿Te gustaría que te explique algún aspecto específico del funcionamiento? 🤔"""
+    
+    elif detail_type == 'safety':
+        response = f"""🛡️ **Seguridad del {equipment_name}**
+
+**Requisitos de seguridad:**
+{selected_equipment.get('safety_requirements', 'Cumple con todas las normas colombianas de seguridad')}
+
+**Medidas incluidas:**
+✅ Certificación de seguridad vigente
+✅ Inspección pre-entrega
+✅ Manual de operación segura
+✅ Capacitación básica incluida
+✅ Soporte técnico durante el alquiler
+
+**Equipos de protección requeridos:**
+- Arnés de seguridad certificado
+- Casco de protección
+- Guantes antideslizantes
+- Calzado de seguridad
+
+¿Necesitas que incluyamos equipos de protección personal en tu cotización? 🦺"""
+    
+    elif detail_type == 'specs':
+        specs = selected_equipment.get('specifications', {})
+        response = f"""📋 **Especificaciones técnicas - {equipment_name}**
+
+**Dimensiones y capacidades:**
+- Altura máxima de trabajo: {selected_equipment.get('max_height', 'N/A')} metros
+- Material: {specs.get('material', 'Acero galvanizado/Aluminio')}
+- Peso máximo: {specs.get('peso_max', 'Según modelo')}
+- Dimensiones base: {specs.get('base', 'Según configuración')}
+
+**Características adicionales:**
+{chr(10).join([f"• {key.title()}: {value}" for key, value in specs.items() if key not in ['material', 'peso_max', 'base']])}
+
+¿Necesitas especificaciones más detalladas para tu proyecto? 📐"""
+    
+    elif detail_type == 'delivery':
+        response = f"""🚚 **Entrega e instalación del {equipment_name}**
+
+**Servicio de entrega incluido:**
+✅ Entrega gratuita en Bogotá y alrededores
+✅ Instalación y configuración básica
+✅ Verificación de seguridad en sitio
+✅ Capacitación al personal
+
+**Proceso de entrega:**
+1️⃣ Coordinamos fecha y hora contigo
+2️⃣ Nuestro equipo lleva el equipo al sitio
+3️⃣ Realizamos instalación y verificación
+4️⃣ Capacitamos a tu personal
+5️⃣ Te entregamos documentación
+
+**Tiempos:**
+- Entrega: 24-48 horas después de confirmado
+- Recogida: Coordinada según tu cronograma
+
+¿Tienes algún requerimiento especial para la entrega? 📅"""
+    
+    elif detail_type == 'training':
+        response = f"""🎓 **Capacitación para el {equipment_name}**
+
+**Capacitación incluida:**
+✅ Operación segura del equipo
+✅ Procedimientos de emergencia
+✅ Inspección diaria básica
+✅ Uso correcto de EPP
+
+**Duración:** 2-3 horas según el equipo
+**Modalidad:** Presencial en tu obra
+**Certificado:** Entregamos constancia de capacitación
+
+**Temas principales:**
+- Principios de seguridad en altura
+- Operación paso a paso del equipo
+- Identificación de riesgos
+- Protocolo de emergencias
+- Mantenimiento básico
+
+¿Cuántas personas de tu equipo necesitan capacitación? 👥"""
+    
+    else:
+        # Información general del equipo
+        response = f"""ℹ️ **Información completa - {equipment_name}**
+
+{selected_equipment.get('description', 'Equipo profesional para trabajo en altura')}
+
+**Resumen:**
+- 🏗️ Altura máxima: {selected_equipment.get('max_height', 'N/A')} metros
+- 💰 Precio por día: ${selected_equipment.get('daily_price', 0):,.0f}
+- 🎯 Ideal para: {', '.join(selected_equipment.get('use_cases', ['trabajo general']))}
+
+**¿Qué te gustaría saber específicamente?**
+🔧 Funcionamiento y operación
+🛡️ Medidas de seguridad
+📋 Especificaciones técnicas
+🚚 Entrega e instalación
+🎓 Capacitación incluida
+
+¿O prefieres que procedamos con la cotización? 😊"""
+    
+    state['response'] = response
+    logger.info(f"Detalles de equipo proporcionados: {detail_type or 'general'}")
     return state
 
 def consultation_node(state: AgentState) -> AgentState:
     """
-    Gestiona la conversación consultiva con el cliente de forma optimizada.
+    Nodo de consulta mejorado con mejor extracción de información
     """
     print("---CONSULTATION NODE---")
     
     messages = state['messages']
-    # Determina si es el primer mensaje real del usuario
-    is_first_interaction = len(messages) <= 2
     last_user_message = state.get('current_message', '')
+    conversation_stage = state.get('conversation_stage', 'welcome')
+    
+    # Si es una pregunta sobre cotización sin info completa
+    if any(word in last_user_message.lower() for word in ['cotiza', 'precio', 'costo']) and not state.get('project_details', {}).get('height'):
+        state['response'] = """¡Perfecto! Con gusto te ayudo con una cotización personalizada. 
 
+Para darte las mejores opciones necesito conocer un poco sobre tu proyecto:
+
+🏗️ **¿A qué altura necesitas trabajar?** (en metros o número de pisos)
+🔨 **¿Qué tipo de trabajo vas a realizar?** (construcción, mantenimiento, limpieza, pintura, etc.)
+⏰ **¿Por cuánto tiempo necesitas el equipo?** (días, semanas, meses)
+
+Con esta información podré recomendarte el equipo perfecto y darte un precio exacto. 😊"""
+        return state
+    
     try:
-        # Extraer información usando método simple primero
-        extracted = extract_info_simple(last_user_message)
+        # Extracción mejorada de información
+        extracted = extract_info_advanced(last_user_message)
         
         # Actualizar estado con los datos extraídos
         if extracted.get("user_name"): 
@@ -234,41 +756,63 @@ def consultation_node(state: AgentState) -> AgentState:
             state["phone"] = extracted["phone"]
         if extracted.get("email"): 
             state["email"] = extracted["email"]
-        if extracted.get("rut_text"):
-            if "documents" not in state: state["documents"] = {}
-            state["documents"]["rut"] = {"text": extracted["rut_text"], "received": True}
         
+        # Actualizar detalles del proyecto
         if extracted["project_details"]:
             if "project_details" not in state: 
                 state["project_details"] = {}
             for key, value in extracted["project_details"].items():
                 if value is not None:
                     state["project_details"][key] = value
-
-        # Generar respuesta basada en lo que falta
+        
+        # Generar respuesta contextual
         project_details = state.get('project_details', {})
         
-        if is_first_interaction:
+        # Determinar qué información falta
+        missing_info = []
+        if not project_details.get('height'):
+            missing_info.append("altura de trabajo")
+        if not project_details.get('work_type'):
+            missing_info.append("tipo de trabajo")
+        if not project_details.get('duration_text'):
+            missing_info.append("duración del proyecto")
+        
+        if len(messages) <= 2:  # Primera interacción
             response_text = generate_response("welcome", {})
-        elif not project_details.get('height'):
-            response_text = "¿A qué altura necesitas trabajar? (en metros o número de pisos)"
-        elif not project_details.get('work_type'):
-            response_text = "¿Qué tipo de trabajo vas a realizar? (limpieza, mantenimiento, construcción, etc.)"
-        elif not project_details.get('duration_text'):
-            response_text = "¿Por cuánto tiempo necesitas el equipo? (días, semanas, meses)"
+        elif missing_info:
+            if len(missing_info) == 3:
+                response_text = "¿Podrías contarme más sobre tu proyecto? Me ayudaría saber a qué altura necesitas trabajar, qué tipo de trabajo vas a realizar y por cuánto tiempo necesitas el equipo. 😊"
+            elif 'altura de trabajo' in missing_info:
+                response_text = "¿A qué altura necesitas trabajar? Puedes decirme en metros o número de pisos. 📏"
+            elif 'tipo de trabajo' in missing_info:
+                response_text = "¿Qué tipo de trabajo vas a realizar? Por ejemplo: construcción, mantenimiento, limpieza, pintura, instalaciones, etc. 🔨"
+            elif 'duración del proyecto' in missing_info:
+                response_text = "¿Por cuánto tiempo necesitas el equipo? (días, semanas o meses) ⏰"
         else:
-            # Si tenemos toda la info, confirmar que buscaremos opciones
-            response_text = f"Perfecto, tengo toda la información. Voy a buscar las mejores opciones de equipos para tu trabajo de {project_details.get('work_type')} a {project_details.get('height')}m por {project_details.get('duration_text')}."
+            # 🎯 AQUÍ ESTÁ LA CLAVE: SI TENEMOS TODA LA INFO, FORZAR EL SIGUIENTE NODO
+            height_text = f"{project_details.get('height')}m"
+            work_type = project_details.get('work_type', 'trabajo')
+            duration = project_details.get('duration_text', 'el tiempo especificado')
+            
+            response_text = f"""¡Perfecto! Ya tengo toda la información que necesito:
+
+📋 **Resumen de tu proyecto:**
+- Altura: {height_text}
+- Trabajo: {work_type}
+- Duración: {duration}
+
+Ahora voy a buscar las mejores opciones de equipos para tu proyecto. Dame un momento... 🔍"""
+            
+            # 🚀 FORZAR QUE EL PRÓXIMO NODO SEA ANALYZE_REQUIREMENTS
+            state['next_node'] = 'analyze_requirements'
+            state['conversation_stage'] = 'analyzing_requirements'
         
         state['response'] = response_text
-        logger.info(f"Consulta procesada exitosamente")
+        logger.info("Consulta mejorada procesada exitosamente")
         
     except Exception as e:
         logger.error(f"Error en consultation_node: {e}")
-        if "429" in str(e) or "quota" in str(e).lower():
-            state['response'] = generate_response("quota_exceeded", {})
-        else:
-            state['response'] = generate_response("error", {})
+        state['response'] = generate_response("error", {})
     
     return state
 
