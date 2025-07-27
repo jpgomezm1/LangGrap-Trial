@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from config import config
@@ -8,6 +9,7 @@ from services.telegram_service import TelegramService
 from services.equipment_service import EquipmentService
 from services.email_service import EmailService
 from agent.graph import create_agent_graph
+from cleanup_history import clear_database_history  # <-- AÑADIR IMPORT
 
 # Configurar logging
 logging.basicConfig(
@@ -131,7 +133,13 @@ class TelegramAgentBot:
             logger.error(f"Error fatal iniciando bot: {e}")
             raise
 
-if __name__ == "__main__":
+# --- AÑADIR ESTE BLOQUE ---
+def main():
+    if os.getenv("ASK_CLEANUP", "true").lower() == "true":
+        choice = input("🤔 ¿Deseas limpiar el historial de conversaciones antes de iniciar? (s/n): ").lower()
+        if choice == 's':
+            clear_database_history()
+    
     try:
         bot = TelegramAgentBot()
         bot.run()
@@ -139,3 +147,7 @@ if __name__ == "__main__":
         logger.info("Bot detenido por el usuario")
     except Exception as e:
         logger.error(f"Error crítico: {e}")
+# --- FIN DEL BLOQUE ---
+
+if __name__ == "__main__":
+    main()  # <-- CAMBIADO: ahora llama a main() en lugar de crear directamente el bot

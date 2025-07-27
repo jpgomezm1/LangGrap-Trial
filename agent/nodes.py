@@ -1,9 +1,9 @@
 # agent/nodes.py
 
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from agent.state import AgentState
-from agent.tools import get_agent_tools
+from agent.tools import get_agent_tools, process_rut_with_gemini, generate_quotation_pdf
 from services.email_service import EmailService
 from config import config
 import json
@@ -62,19 +62,55 @@ Puedes enviarme el RUT como foto del documento o simplemente escribir el número
 
 def router_node(state: AgentState) -> AgentState:
     """
-    Nodo central de enrutamiento. Ahora es más inteligente para evitar atascos.
+    Nodo central de enrutamiento rediseñado con lógica explícita y priorizada.
     """
-    conversation_history = "\n".join(
-        [f"{'Cliente' if isinstance(msg, HumanMessage) else 'Asistente'}: {msg.content}" for msg in state.get('messages', [])[-6:]]
-    )
+    print("---ROUTER NODE---")
+    messages = state['messages']
+    
+    if not messages:
+        state["next_node"] = "consultation"
+        logger.info("Router: Sin mensajes, comenzando consulta")
+        return state
+    
+    last_message = messages[-1].content.lower()
 
-    # REGLA DE ORO MEJORADA: Solo termina si la última respuesta es del asistente Y el nuevo mensaje del cliente es muy corto o no aporta nada.
-    last_message_is_from_assistant = len(state['messages']) > 0 and isinstance(state['messages'][-1], AIMessage)
+    # --- Lógica de enrutamiento explícita y priorizada ---
+
+    # 1. Si acabamos de recibir un documento, debemos procesarlo.
+    if state.get("document_path") and not state.get("client_info"):
+        state["next_node"] = "process_rut"
+        logger.info("Router: Documento recibido, procesando RUT")
+        return state
+    
+    # 2. Si el usuario pide cotización y ya tenemos equipo seleccionado
+    if ("cotiza" in last_message or "cotización" in last_message or "precio" in last_message) and state.get('selected_equipment'):
+        # Si aún no tenemos info del cliente, la pedimos
+        if not state.get('client_info'):
+            state["next_node"] = "collect_documents"
+            logger.info("Router: Cotización solicitada, recolectando documentos")
+        else: # Si ya la tenemos, generamos la cotización
+            state["next_node"] = "generate_quotation"
+            logger.info("Router: Generando cotización")
+        return state
+
+    # 3. Si ya se generó el PDF, lo enviamos.
+    if state.get("quotation_pdf_path"):
+        state["next_node"] = "send_quotation"
+        logger.info("Router: PDF listo, enviando cotización")
+        return state
+
+    # 4. REGLA DE ORO MEJORADA: Solo termina si la última respuesta es del asistente Y el nuevo mensaje del cliente es muy corto o no aporta nada.
+    last_message_is_from_assistant = len(messages) > 0 and isinstance(messages[-1], AIMessage)
 
     if last_message_is_from_assistant:
         state["next_node"] = "END"
-        logger.info("Router (Sebastián) decidió: END (esperando respuesta del cliente)")
+        logger.info("Router: Esperando respuesta del cliente")
         return state
+
+    # Lógica basada en LLM como respaldo
+    conversation_history = "\n".join(
+        [f"{'Cliente' if isinstance(msg, HumanMessage) else 'Asistente'}: {msg.content}" for msg in messages[-6:]]
+    )
 
     router_prompt = f"""Eres "Sebastián", el asistente de ventas experto de EquiposUp. Tu trabajo es decidir el siguiente paso en la conversación.
 
@@ -100,72 +136,42 @@ OPCIONES (siguiente nodo):
         response = llm.invoke(router_prompt)
         next_node = response.content.strip().lower().split()[0].replace("`", "").replace("'", "").replace('"', '')
         state["next_node"] = next_node
-        logger.info(f"Router (Sebastián) decidió: {state['next_node']}")
+        logger.info(f"Router (LLM): {state['next_node']}")
     except Exception as e:
         logger.error(f"Error en router_node: {e}", exc_info=True)
-        state["next_node"] = "END"
-        state["response"] = "¡Uy! Tuve un percance técnico. ¿Podríamos intentarlo de nuevo?"
-    
+        state["next_node"] = "consultation"
+        
     return state
 
+# --- REEMPLAZA consultation_node CON ESTA VERSIÓN MEJORADA ---
 def consultation_node(state: AgentState) -> AgentState:
     """
-    Gestiona la conversación consultiva con el cliente con un prompt dinámico y consciente del historial.
+    Gestiona la conversación consultiva con el cliente de forma más inteligente.
     """
     print("---CONSULTATION NODE---")
     
-    # Construir el historial de la conversación
-    conversation_history = ""
-    messages = state.get('messages', [])
-    for msg in messages:
-        role = "Cliente" if isinstance(msg, HumanMessage) else "Asistente"
-        conversation_history += f"{role}: {msg.content}\n"
-    
+    messages = state['messages']
+    # Determina si es el primer mensaje real del usuario
+    is_first_interaction = len(messages) <= 2
     last_user_message = state.get('current_message', '')
-    is_first_message = len(messages) <= 1
-    
-    # --- PROMPT DINÁMICO MEJORADO ---
-    if is_first_message:
-        system_prompt = f"""
-Eres "Sebastián", un asistente de ventas experto y amigable de EquiposUp. Es el primer contacto con este cliente.
 
-**Instrucciones:**
-1. **Presentación Natural:** Preséntate de manera cálida y profesional
-2. **Pregunta Abierta:** Pregunta en qué puedes ayudar al cliente
-3. **Tono Conversacional:** Habla como un humano, no como un robot
-4. **Guía Sutil:** Si es apropiado, menciona que necesitarás algunos detalles del proyecto
-
-Último mensaje del cliente: "{last_user_message}"
-
-Responde de manera natural y amigable.
-"""
+    if is_first_interaction:
+        system_prompt = """Eres "Sebastián", un asistente de ventas amigable y experto de EquiposUp. Tu propósito es entender la necesidad del cliente para recomendarle la maquinaria de alturas perfecta. Inicia la conversación presentándote cálidamente y haz una pregunta abierta para empezar, como: '¡Hola! Soy Sebastián de EquiposUp. ¿En qué tipo de proyecto o trabajo necesitas ayuda hoy?'"""
     else:
-        system_prompt = f"""
-Eres "Sebastián", asistente de ventas de EquiposUp. Mantienes una conversación fluida con un cliente.
+        # Extrae el historial para dar contexto, excluyendo el último SystemMessage si existe
+        conversation_history = "\n".join([f"{msg.type}: {msg.content}" for msg in messages if not isinstance(msg, SystemMessage)])
+        system_prompt = f"""Eres "Sebastián", un experto de EquiposUp. Continúa la conversación de forma natural. NO saludes de nuevo. NO repitas la información que el usuario te acaba de dar. Tu objetivo es obtener los detalles que te faltan.
 
-**Historial de la conversación:**
+**Historial de la Conversación:**
 {conversation_history}
 
-**Estado actual:**
-- Cliente: {state.get('user_name', 'No identificado')}
-- Empresa: {state.get('company_name', 'No especificada')}
-- Proyecto: {state.get('project_details', {})}
-
-**Instrucciones:**
-1. **Continuidad:** Usa el contexto del historial para responder coherentemente
-2. **Extracción:** Identifica y confirma cualquier información nueva (nombre, empresa, altura, duración, tipo de trabajo, teléfono, email, RUT)
-3. **Progreso Natural:** Si tienes suficiente información para el siguiente paso, guía naturalmente hacia allá
-4. **Una Pregunta:** Haz máximo una pregunta clara por respuesta
-5. **Evita Repetición:** No repitas saludos o información ya confirmada
-
-Último mensaje del cliente: "{last_user_message}"
-
-Genera una respuesta que extraiga información relevante y mantenga la conversación fluida.
+Basado en el historial, identifica la siguiente pieza de información que necesitas (ej: tipo de superficie, altura requerida, si necesita operario) y haz UNA sola pregunta clara y concisa para obtenerla. Sé breve y ve al grano.
 """
-
+    
     try:
-        # Llamada al LLM con el prompt dinámico
-        response = llm.invoke(system_prompt)
+        # Preparamos los mensajes para el LLM
+        llm_messages = [SystemMessage(content=system_prompt)] + messages[-1:]
+        response = llm.invoke(llm_messages)
         
         # Extraer información del mensaje actual
         extraction_prompt = f"""
@@ -327,39 +333,45 @@ def collect_documents_node(state: AgentState) -> AgentState:
     
     return state
 
+# --- AÑADIR ESTE NUEVO NODO MEJORADO ---
 def process_rut_node(state: AgentState) -> AgentState:
     """
     Procesa el archivo RUT (PDF) para extraer la información del cliente.
     """
     print("---PROCESS RUT NODE---")
-    file_path = state.get("document_path") # Asumimos que la ruta del PDF se guarda en el estado
-
+    file_path = state.get("document_path")
+    
     if not file_path:
-        # Si no hay documento, pide al usuario que lo envíe
-        message = "¡Entendido! Para generar la cotización, necesito que por favor me envíes el RUT de la empresa en formato PDF."
-        state['response'] = message
+        state['response'] = "Por favor, para continuar, envíame el archivo PDF de tu RUT."
         return state
 
     try:
-        # Llama a la herramienta para procesar el PDF
-        from agent.tools import process_rut_with_gemini
-        client_info = process_rut_with_gemini(file_path) # Esta herramienta usa Gemini Vision
+        client_info = process_rut_with_gemini(file_path)
         
-        # Actualiza el estado con la información extraída
+        if "error" in client_info:
+            state['response'] = f"Tuve un problema al leer el documento. El error fue: {client_info['error']}. ¿Podrías intentar enviarlo de nuevo?"
+            return state
+        
+        # Actualizamos el estado con la información extraída
         state['client_info'] = client_info
+        state['company_name'] = client_info.get('company_name')
+        state['nit'] = client_info.get('nit')
+        state['email'] = client_info.get('email')
+        state['document_path'] = None  # Limpiamos la ruta para no procesarlo de nuevo
+        
+        state['response'] = f"¡Perfecto! He procesado el RUT. Confirmo que la empresa es {client_info.get('company_name', 'N/A')}. Ahora, procederé a generar la cotización."
+        
         print(f"Información del RUT procesada: {client_info}")
-
-        message = f"¡Perfecto! He procesado el RUT. Veo que la empresa es {client_info.get('company_name')}. Ahora, procederé a generar la cotización."
-        state['response'] = message
+        logger.info(f"RUT procesado exitosamente para {client_info.get('company_name')}")
         
     except Exception as e:
         print(f"Error al procesar el RUT: {e}")
         logger.error(f"Error al procesar el RUT: {e}")
-        message = "Tuve un problema al leer el documento. ¿Podrías intentar enviarlo de nuevo, por favor?"
-        state['response'] = message
+        state['response'] = "Tuve un problema al leer el documento. ¿Podrías intentar enviarlo de nuevo, por favor?"
     
     return state
 
+# --- MODIFICA generate_quotation_node ---
 def generate_quotation_node(state: AgentState) -> AgentState:
     """
     Genera el PDF de la cotización y lo prepara para el envío.
@@ -387,14 +399,14 @@ def generate_quotation_node(state: AgentState) -> AgentState:
         # Calcular cotización
         equipment_ids = [eq['id'] for eq in recommended_equipment]
         
-        from agent.tools import CalculateQuotationTool, generate_quotation_pdf
+        from agent.tools import CalculateQuotationTool
         quotation_tool = CalculateQuotationTool()
         
         quotation_data = quotation_tool._run(equipment_ids, rental_days)
         quotation = json.loads(quotation_data)
         
-        # Generar PDF de la cotización
-        quotation_path = generate_quotation_pdf(
+        # ESTA ES LA CORRECCIÓN CRÍTICA: Generar PDF y devolver la ruta
+        pdf_path = generate_quotation_pdf(
             client_info=state.get('client_info', {}),
             recommended_equipment=state['recommended_equipment'],
             quotation_data=quotation,
@@ -402,7 +414,7 @@ def generate_quotation_node(state: AgentState) -> AgentState:
         )
         
         # Guarda la ruta del PDF de la cotización en el estado
-        state['quotation_pdf_path'] = quotation_path
+        state['quotation_pdf_path'] = pdf_path
         
         # Generar mensaje de cotización
         quotation_message = f"""🎉 **Cotización Generada - {config.COMPANY_NAME}**
@@ -450,6 +462,7 @@ def generate_quotation_node(state: AgentState) -> AgentState:
         
     return state
 
+# --- MODIFICA send_quotation_node ---
 def send_quotation_node(state: AgentState) -> AgentState:
     """
     Envía la cotización al cliente y notifica al equipo comercial.
@@ -460,13 +473,13 @@ def send_quotation_node(state: AgentState) -> AgentState:
     quotation_pdf_path = state.get("quotation_pdf_path")
     
     if not quotation_pdf_path:
-        print("Error: No se encontró la ruta del PDF de la cotización en el estado.")
+        print("❌ Error: No se encontró la ruta del PDF de la cotización en el estado.")
         logger.error("No se encontró la ruta del PDF de la cotización en el estado.")
-        state['response'] = "Hubo un problema generando el documento. Nuestro equipo comercial se pondrá en contacto contigo."
+        state['response'] = "Lo siento, tuve un problema generando el documento de la cotización. Un asesor comercial se pondrá en contacto contigo a la brevedad."
         return state
 
     # Prepara el mensaje final para el usuario
-    final_message = "Te he enviado la cotización a tu correo y también adjunta aquí en el chat. Si tienes alguna otra pregunta, no dudes en consultarme."
+    final_message = "¡Listo! Aquí tienes tu cotización. Nuestro equipo comercial la revisará y se pondrá en contacto contigo si es necesario. ¡Gracias por confiar en EquiposUp!"
     
     # La responsabilidad de enviar el mensaje y el documento por Telegram
     # se delega al servicio de Telegram para mantener los nodos agnósticos a la plataforma.
@@ -512,17 +525,17 @@ def notify_commercial_node(state: AgentState) -> AgentState:
         logger.info(f"Cotización completada para usuario {state.get('user_id')} - {state.get('company_name')}")
         
         state['commercial_notified'] = True
-        state['response'] = """¡Perfecto! Tu cotización ha sido procesada exitosamente. 
+        state['response'] = f"""¡Perfecto! Tu cotización ha sido procesada exitosamente. 
 
 Nuestro equipo comercial ha sido notificado y se pondrá en contacto contigo en las próximas horas para coordinar todos los detalles del alquiler.
 
-¡Gracias por elegir EquiposUp para tu proyecto! 🎉
+¡Gracias por elegir {config.COMPANY_NAME} para tu proyecto! 🎉
 
-Si tienes alguna pregunta urgente, puedes contactarnos directamente en nuestro sitio web: https://equiposup.com/"""
+Si tienes alguna pregunta urgente, puedes contactarnos directamente en: {config.COMPANY_DOMAIN}"""
         
     except Exception as e:
         logger.error(f"Error en notify_commercial_node: {e}")
         state['commercial_notified'] = True
-        state['response'] = "¡Cotización completada! Nuestro equipo se pondrá en contacto contigo pronto. ¡Gracias por elegir EquiposUp! 🚀"
+        state['response'] = f"¡Cotización completada! Nuestro equipo se pondrá en contacto contigo pronto. ¡Gracias por elegir {config.COMPANY_NAME}! 🚀"
     
     return state

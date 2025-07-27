@@ -20,12 +20,16 @@ class Settings(BaseSettings):
     MAX_TOKENS: int = Field(default=1000, description="Máximo número de tokens")
     
     # Configuración de base de datos
-    DATABASE_URL: str = Field(default="sqlite:///equipos_bot.db", description="URL de la base de datos")
+    # --- MODIFICAR ESTA LÍNEA ---
+    DATABASE_URL: str = Field(default=os.getenv("DATABASE_URL", "postgresql://neondb_owner:npg_Uduk4FqGZbn1@ep-cold-snow-adtfewzz-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require"), description="URL de la base de datos")
     
     # Configuración de la empresa
     COMPANY_NAME: str = Field(default="EquiposUp", description="Nombre de la empresa")
     COMPANY_EMAIL: str = Field(default="ventas@equiposup.com", description="Email de la empresa")
     COMPANY_PHONE: str = Field(default="+57 300 123 4567", description="Teléfono de la empresa")
+    
+    # --- AÑADIR ESTA LÍNEA ---
+    COMPANY_DOMAIN: str = Field(default="updates.stayirrelevant.com", description="Dominio de la empresa para enviar correos")
     
     # Configuración de email (Resend) - opcional
     RESEND_API_KEY: Optional[str] = Field(default=None, description="API Key de Resend para emails")
@@ -72,6 +76,7 @@ def validate_config():
     if config.RESEND_API_KEY:
         print(f"📧 Resend API Key: {'*' * 20}...{config.RESEND_API_KEY[-4:]}")
     print(f"🏢 Empresa: {config.COMPANY_NAME}")
+    print(f"🌐 Dominio: {config.COMPANY_DOMAIN}")
     print(f"🤖 Modelo: {config.MODEL_NAME}")
     
     return True

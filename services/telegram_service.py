@@ -31,11 +31,13 @@ Para comenzar, simplemente escríbeme contándome sobre tu proyecto. ¡Empecemos
         if user_id in self.active_conversations:
             del self.active_conversations[user_id]
 
+    # --- MODIFICA handle_message PARA USAR EL NUEVO MÉTODO ---
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE, agent_graph):
         """Maneja mensajes de texto, delega toda la lógica al agente."""
         user_id = str(update.effective_user.id)
         message_text = update.message.text
         logger.info(f"Mensaje de usuario {user_id}: {message_text[:50]}...")
+        print(f"INFO: Mensaje de usuario {user_id}: {message_text[:50]}...")
 
         try:
             # 1. Obtener o crear estado de la conversación.
@@ -45,51 +47,8 @@ Para comenzar, simplemente escríbeme contándome sobre tu proyecto. ¡Empecemos
             state["current_message"] = message_text
             state["messages"].append(HumanMessage(content=message_text))
             
-            # 3. Guardar el mensaje del usuario en la base de datos
-            await self._save_message_to_db(user_id, "user", message_text)
-            
-            # 4. Ejecutar el grafo del agente con la configuración correcta.
-            config = {"recursion_limit": 25}
-            result = agent_graph.invoke(state, config=config)
-            
-            # 5. Obtener la respuesta y añadirla al historial.
-            response_text = result.get("response", "Lo siento, no pude procesar tu mensaje.")
-            result["messages"].append(AIMessage(content=response_text))
-            
-            # 6. Guardar el mensaje del agente en la base de datos
-            await self._save_message_to_db(user_id, "agent", response_text)
-            
-            # 7. Actualizar el cache con el estado más reciente.
-            self.active_conversations[user_id] = result
-            
-            # --- INICIO DE LA MEJORA ---
-            
-            # 8. Comprobar si la respuesta del agente es un documento para enviar
-            if result.get("response_type") == "document" and result.get("document_to_send"):
-                document_path = result["document_to_send"]
-                caption = result.get("final_message", "Aquí tienes tu cotización.")
-                
-                try:
-                    # Enviar el documento PDF
-                    with open(document_path, 'rb') as doc_file:
-                        await context.bot.send_document(
-                            chat_id=update.effective_chat.id,
-                            document=doc_file,
-                            caption=caption,
-                            filename=os.path.basename(document_path)
-                        )
-                    logger.info(f"Cotización en PDF enviada a {user_id}")
-                    # Opcional: limpiar el archivo PDF después de enviarlo
-                    # os.remove(document_path)
-                except Exception as e:
-                    logger.error(f"Error al enviar el documento a {user_id}: {e}")
-                    await update.message.reply_text("Tuve un problema al enviar el documento. Ya notifiqué al equipo.")
-
-            # Si no es un documento, enviar una respuesta de texto normal
-            else:
-                await update.message.reply_text(response_text)
-            
-            # --- FIN DE LA MEJORA ---
+            # 3. Usar el nuevo método auxiliar
+            await self._invoke_agent_and_reply(state, update, context, agent_graph)
             
         except Exception as e:
             logger.error(f"Error procesando mensaje: {e}", exc_info=True)
@@ -97,6 +56,7 @@ Para comenzar, simplemente escríbeme contándome sobre tu proyecto. ¡Empecemos
                 "Disculpa, tuve un problema procesando tu mensaje. ¿Podrías intentar de nuevo?"
             )
 
+    # --- REEMPLAZA TU handle_document CON ESTE ---
     async def handle_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE, agent_graph):
         """
         Gestiona la recepción de documentos (específicamente el RUT en PDF).
@@ -104,8 +64,8 @@ Para comenzar, simplemente escríbeme contándome sobre tu proyecto. ¡Empecemos
         user_id = str(update.effective_user.id)
         
         try:
-            # --- INICIO DE LA MEJORA ---
-            
+            print(f"INFO: Documento recibido de usuario {user_id}: {update.message.document.file_name}")
+
             # 1. Crear un directorio temporal para guardar los documentos si no existe
             doc_dir = "documentos_recibidos"
             os.makedirs(doc_dir, exist_ok=True)
@@ -117,6 +77,7 @@ Para comenzar, simplemente escríbeme contándome sobre tu proyecto. ¡Empecemos
             await file.download_to_drive(file_path)
             
             logger.info(f"Documento de {user_id} guardado en: {file_path}")
+            print(f"INFO: Documento de {user_id} guardado en: {file_path}")
 
             # 3. Preparar el estado para invocar al agente
             state = await self._get_or_create_conversation_state(user_id, update.effective_user)
@@ -144,34 +105,75 @@ Para comenzar, simplemente escríbeme contándome sobre tu proyecto. ¡Empecemos
             
             # 5. Actualizar estado y notificar al grafo que se recibió un documento.
             state["documents"] = documents
-            state["document_path"] = file_path  # Añadimos la ruta del PDF al estado
+            state["document_path"] = file_path  # <-- CLAVE: Añadimos la ruta del PDF al estado
             state["current_message"] = user_feedback
             state["messages"].append(HumanMessage(content=user_feedback))
 
-            # 6. Guardar el mensaje en la base de datos
-            await self._save_message_to_db(user_id, "user", f"Documento adjuntado: {document_name}")
-
-            # 7. Ejecutar grafo para que decida el siguiente paso.
-            config = {"recursion_limit": 25}
-            result = agent_graph.invoke(state, config=config)
-            
-            response_text = result.get("response", "¡Documento recibido! Déjame ver qué más necesito.")
-            result["messages"].append(AIMessage(content=response_text))
-            
-            # 8. Guardar la respuesta del agente
-            await self._save_message_to_db(user_id, "agent", response_text)
-            
-            self.active_conversations[user_id] = result
-            
-            await update.message.reply_text(response_text)
-            
-            # --- FIN DE LA MEJORA ---
+            # 6. Usar el nuevo método auxiliar
+            await self._invoke_agent_and_reply(state, update, context, agent_graph)
             
         except Exception as e:
             logger.error(f"Error procesando documento: {e}", exc_info=True)
             await update.message.reply_text(
                 "Hubo un problema procesando tu documento. ¿Podrías intentar enviarlo de nuevo?"
             )
+
+    # --- CREA ESTE NUEVO MÉTODO AUXILIAR ---
+    async def _invoke_agent_and_reply(self, state: AgentState, update: Update, context: ContextTypes.DEFAULT_TYPE, agent_graph):
+        """Método auxiliar que invoca al agente y maneja la respuesta."""
+        user_id = state['user_id']
+        
+        try:
+            # 1. Guardar el mensaje del usuario en la base de datos
+            await self._save_message_to_db(user_id, "user", state["current_message"])
+            
+            # 2. Ejecutar el grafo del agente con la configuración correcta.
+            config = {"recursion_limit": 25}
+            result = agent_graph.invoke(state, config=config)
+            
+            # 3. Obtener la respuesta y añadirla al historial.
+            response_text = result.get("response", "Lo siento, no pude procesar tu mensaje.")
+            result["messages"].append(AIMessage(content=response_text))
+            
+            # 4. Guardar el mensaje del agente en la base de datos
+            await self._save_message_to_db(user_id, "agent", response_text)
+            
+            # 5. Actualizar el cache con el estado más reciente.
+            self.active_conversations[user_id] = result
+            
+            # 6. Lógica para enviar texto o documento
+            if result.get("response_type") == "document" and result.get("document_to_send"):
+                document_path = result["document_to_send"]
+                caption = result.get("final_message", "Aquí tienes tu cotización.")
+                
+                try:
+                    # Enviar el documento PDF
+                    with open(document_path, 'rb') as doc_file:
+                        await context.bot.send_document(
+                            chat_id=update.effective_chat.id,
+                            document=doc_file,
+                            caption=caption,
+                            filename=os.path.basename(document_path)
+                        )
+                    logger.info(f"Cotización en PDF enviada a {user_id}")
+                    print(f"INFO: Cotización en PDF enviada a {user_id}")
+                    # Opcional: limpiar el archivo PDF después de enviarlo
+                    # os.remove(document_path)
+                except FileNotFoundError:
+                    logger.error(f"Error: No se encontró el archivo PDF en {document_path}")
+                    print(f"❌ Error: No se encontró el archivo PDF en {document_path}")
+                    await update.message.reply_text("Lo siento, no pude encontrar el archivo de la cotización para enviártelo.")
+                except Exception as e:
+                    logger.error(f"Error al enviar el documento a {user_id}: {e}")
+                    await update.message.reply_text("Tuve un problema al enviar el documento. Ya notifiqué al equipo.")
+
+            # Si no es un documento, enviar una respuesta de texto normal
+            else:
+                await update.message.reply_text(response_text)
+                
+        except Exception as e:
+            logger.error(f"Error en _invoke_agent_and_reply: {e}", exc_info=True)
+            await update.message.reply_text("Disculpa, tuve un problema procesando tu solicitud.")
 
     async def _get_or_create_conversation_state(self, user_id: str, user) -> AgentState:
         """Obtiene el estado del cache, la BD o crea uno nuevo."""
@@ -215,7 +217,12 @@ Para comenzar, simplemente escríbeme contándome sobre tu proyecto. ¡Empecemos
                     documents=conversation.documents or {},
                     messages=langchain_messages,
                     quotation_sent=conversation.quotation_sent or False,
-                    commercial_notified=conversation.commercial_notified or False
+                    commercial_notified=conversation.commercial_notified or False,
+                    needs_more_info=False,
+                    ready_for_quotation=False,
+                    current_message="",
+                    response="",
+                    next_node="consultation"
                 )
             else:
                 # Crear nueva conversación en la BD
@@ -239,7 +246,12 @@ Para comenzar, simplemente escríbeme contándome sobre tu proyecto. ¡Empecemos
                     recommended_equipment=[],
                     documents={},
                     quotation_sent=False,
-                    commercial_notified=False
+                    commercial_notified=False,
+                    needs_more_info=False,
+                    ready_for_quotation=False,
+                    current_message="",
+                    response="",
+                    next_node="consultation"
                 )
             
             return state

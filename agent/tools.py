@@ -13,10 +13,10 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.units import inch
 from datetime import datetime
+from config import config  # Importar config correctamente
 
-# Configura la API de Gemini (asumiendo que ya tienes la key en tus variables de entorno)
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-genai.configure(api_key=GOOGLE_API_KEY)
+# Configura la API de Gemini usando la configuración centralizada
+genai.configure(api_key=config.GOOGLE_API_KEY)
 
 class GetEquipmentArgs(BaseModel):
     """Argumentos para la herramienta GetEquipment"""
@@ -196,20 +196,16 @@ class ValidateDocumentTool(BaseTool):
         
         return "Documento válido"
 
+# --- AÑADIR ESTA NUEVA FUNCIÓN MEJORADA ---
 def process_rut_with_gemini(pdf_path: str) -> dict:
     """
-    Extrae información de un archivo RUT en formato PDF utilizando Gemini Vision.
-
-    Args:
-        pdf_path: La ruta local al archivo PDF del RUT.
-
-    Returns:
-        Un diccionario con la información extraída (ej. company_name, nit).
+    Procesa un archivo PDF (RUT) usando Gemini Vision para extraer información clave.
+    Versión mejorada con mejor manejo de errores y prompt optimizado.
     """
     print(f"🛠️ Procesando RUT desde: {pdf_path}")
     
     try:
-        # Configuración del modelo Gemini Vision
+        # Configuración del modelo Gemini Vision con el modelo más actualizado
         model = genai.GenerativeModel('gemini-1.5-pro-latest')
 
         # Abrir el PDF
@@ -222,25 +218,17 @@ def process_rut_with_gemini(pdf_path: str) -> dict:
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
             image_parts.append(img)
 
-        # Prompt para guiar al modelo en la extracción de datos
+        # Prompt mejorado para mayor precisión
         prompt_parts = [
-            "Analiza la siguiente imagen de un RUT (Registro Único Tributario) de Colombia.",
-            "Extrae la siguiente información en formato JSON estricto:",
-            "- Razon Social (clave: 'company_name')",
-            "- NIT (Número de Identificación Tributaria) (clave: 'nit')",
-            "- Direccion Principal (clave: 'address')",
-            "- Correo Electronico de Notificacion (clave: 'email')",
-            "- Responsabilidades Tributarias (clave: 'responsibilities'), debe ser una lista de strings.",
-            "Si un campo no se encuentra, su valor debe ser null.",
-            *image_parts, # Añade las imágenes al prompt
+            "Eres un experto analista de documentos contables de Colombia. Analiza la siguiente imagen de un RUT (Registro Único Tributario) y extrae de forma precisa la siguiente información en formato JSON. Si un campo no está explícitamente presente, usa `null` como valor. Los campos a extraer son: `company_name` (Razón Social), `nit` (Número de Identificación Tributaria, sin el dígito de verificación), `address` (Dirección Principal), `email` (Correo electrónico de notificación judicial o de contacto), y `responsibilities` (lista de responsabilidades tributarias). Devuelve únicamente el JSON, sin texto introductorio ni explicaciones.",
+            *image_parts,
         ]
 
         # Llamada al modelo
         response = model.generate_content(prompt_parts)
         
-        # Limpiar y parsear la respuesta
-        # Gemini a veces devuelve el JSON dentro de un bloque de código markdown
-        clean_response = response.text.replace("```json", "").replace("```", "").strip()
+        # Limpieza robusta para evitar errores de JSON
+        clean_response = response.text.strip().replace("```json", "").replace("```", "").strip()
         client_info = json.loads(clean_response)
         
         print(f"✅ Información del RUT extraída: {client_info}")
@@ -248,48 +236,52 @@ def process_rut_with_gemini(pdf_path: str) -> dict:
 
     except Exception as e:
         print(f"❌ Error al procesar el RUT con Gemini: {e}")
-        return {"error": str(e)}
+        return {"error": f"No se pudo procesar el documento: {e}"}
 
+# --- AÑADIR ESTA FUNCIÓN MEJORADA ---
 def generate_quotation_pdf(client_info: dict, recommended_equipment: list, quotation_data: dict = None, project_details: dict = None, quotation_id: str = None) -> str:
     """
-    Genera un archivo PDF para la cotización.
-
-    Args:
-        client_info: Diccionario con la información del cliente (extraída del RUT).
-        recommended_equipment: Lista de diccionarios con los equipos recomendados.
-        quotation_data: Datos de la cotización calculada.
-        project_details: Detalles del proyecto.
-        quotation_id: Un identificador único para la cotización.
-
-    Returns:
-        La ruta al archivo PDF generado.
+    Genera un archivo PDF profesional para la cotización con diseño mejorado.
     """
     if not quotation_id:
         quotation_id = f"COT-{datetime.now().strftime('%Y%m%d%H%M%S')}"
     
-    file_path = f"cotizacion_{quotation_id}.pdf"
+    # Crear directorio si no existe
+    os.makedirs("cotizaciones", exist_ok=True)
+    file_path = f"cotizaciones/cotizacion_{quotation_id}.pdf"
     print(f"📄 Creando cotización en PDF: {file_path}")
 
     try:
         c = canvas.Canvas(file_path, pagesize=letter)
         width, height = letter
 
-        # --- Cabecera ---
-        # Asumiendo que tienes un logo en la misma carpeta
-        if os.path.exists("logo.png"):
-            c.drawImage("logo.png", 50, height - 100, width=150, preserveAspectRatio=True)
+        # --- Cabecera Mejorada ---
+        # Logo si existe
+        if os.path.exists("assets/logo.png"):
+            c.drawImage("assets/logo.png", 50, height - 100, width=150, preserveAspectRatio=True)
         
+        # Información de la empresa
+        c.setFont("Helvetica-Bold", 18)
+        c.drawString(72, height - 72, f"{config.COMPANY_NAME}")
+        c.setFont("Helvetica", 12)
+        c.drawString(72, height - 90, f"Email: {config.COMPANY_EMAIL}")
+        c.drawString(72, height - 105, f"Teléfono: {config.COMPANY_PHONE}")
+        
+        # Información de la cotización
         c.setFont("Helvetica-Bold", 16)
         c.drawRightString(width - 50, height - 70, "COTIZACIÓN")
         c.setFont("Helvetica", 12)
         c.drawRightString(width - 50, height - 90, f"Nro: {quotation_id}")
         c.drawRightString(width - 50, height - 110, f"Fecha: {datetime.now().strftime('%Y-%m-%d')}")
+        
+        # Línea separadora
+        c.line(50, height - 130, width - 50, height - 130)
 
         # --- Información del Cliente ---
         c.setFont("Helvetica-Bold", 12)
-        c.drawString(50, height - 150, "Cliente:")
+        c.drawString(50, height - 160, "Información del Cliente:")
         c.setFont("Helvetica", 11)
-        text = c.beginText(50, height - 170)
+        text = c.beginText(50, height - 180)
         text.textLine(f"Razón Social: {client_info.get('company_name', 'N/A')}")
         text.textLine(f"NIT: {client_info.get('nit', 'N/A')}")
         text.textLine(f"Dirección: {client_info.get('address', 'N/A')}")
@@ -299,16 +291,16 @@ def generate_quotation_pdf(client_info: dict, recommended_equipment: list, quota
         # --- Información del Proyecto ---
         if project_details:
             c.setFont("Helvetica-Bold", 12)
-            c.drawString(50, height - 230, "Detalles del Proyecto:")
+            c.drawString(50, height - 250, "Detalles del Proyecto:")
             c.setFont("Helvetica", 11)
-            text = c.beginText(50, height - 250)
+            text = c.beginText(50, height - 270)
             text.textLine(f"Altura requerida: {project_details.get('height', 'N/A')} metros")
             text.textLine(f"Tipo de trabajo: {project_details.get('work_type', 'N/A')}")
             text.textLine(f"Duración: {project_details.get('duration_text', 'N/A')}")
             c.drawText(text)
-            table_start_y = height - 320
+            table_start_y = height - 340
         else:
-            table_start_y = height - 250
+            table_start_y = height - 270
 
         # --- Tabla de Equipos ---
         c.setFont("Helvetica-Bold", 12)
@@ -370,20 +362,22 @@ def generate_quotation_pdf(client_info: dict, recommended_equipment: list, quota
         
         # --- Condiciones ---
         c.setFont("Helvetica-Bold", 10)
-        c.drawString(50, y_position - 40, "Condiciones:")
+        c.drawString(50, y_position - 40, "Condiciones Comerciales:")
         c.setFont("Helvetica", 9)
         conditions_text = c.beginText(50, y_position - 55)
-        conditions_text.textLine("• Precios válidos por 15 días")
-        conditions_text.textLine("• Incluye entrega y recogida en Bogotá")
-        conditions_text.textLine("• Capacitación básica incluida")
-        conditions_text.textLine("• Soporte técnico 24/7")
-        conditions_text.textLine("• Precios sujetos a disponibilidad")
+        conditions_text.textLine("• Precios válidos por 15 días calendario")
+        conditions_text.textLine(f"• Incluye entrega y recogida en {config.COMPANY_DOMAIN}")
+        conditions_text.textLine("• Capacitación básica de seguridad incluida")
+        conditions_text.textLine("• Soporte técnico disponible 24/7")
+        conditions_text.textLine("• Precios sujetos a disponibilidad del equipo")
+        conditions_text.textLine("• Forma de pago: 50% anticipo, 50% contra entrega")
         c.drawText(conditions_text)
         
         # --- Pie de página ---
         c.setFont("Helvetica-Oblique", 9)
-        c.drawString(50, 50, "Cotización válida por 15 días. Precios no incluyen IVA.")
-        c.drawRightString(width - 50, 50, "EquiposUp - Equipos de Altura")
+        c.drawString(50, 50, f"Cotización válida por 15 días. Precios incluyen IVA.")
+        c.drawRightString(width - 50, 50, f"{config.COMPANY_NAME} - Equipos de Altura")
+        c.drawCentredString(width/2, 35, f"Generado desde: {config.COMPANY_DOMAIN}")
 
         c.save()
         print(f"✅ Cotización guardada en: {file_path}")

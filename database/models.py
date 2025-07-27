@@ -5,6 +5,7 @@ from database.connection import Base
 
 class Equipment(Base):
     __tablename__ = "equipment"
+    __table_args__ = {'schema': 'public'}  # Añadir esto
     
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(255), nullable=False)
@@ -25,10 +26,11 @@ class Message(Base):
     Modelo para almacenar cada mensaje individual de una conversación.
     """
     __tablename__ = "messages"
+    __table_args__ = {'schema': 'public'}  # Añadir esto
 
     id = Column(Integer, primary_key=True)
-    # Crea una clave foránea que apunta al ID de la tabla 'conversations'
-    conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=False)
+    # Especificar el esquema en la ForeignKey también
+    conversation_id = Column(Integer, ForeignKey("public.conversations.id"), nullable=False)
     # Define quién envió el mensaje: 'user' o 'agent'
     sender = Column(String(50), nullable=False)
     # El contenido del mensaje
@@ -47,6 +49,7 @@ class Conversation(Base):
     Modelo para almacenar la información de una conversación.
     """
     __tablename__ = "conversations"
+    __table_args__ = {'schema': 'public'}  # Añadir esto
     
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(String(50), nullable=False)  # Telegram user ID
@@ -78,6 +81,7 @@ class Conversation(Base):
 
 class Quotation(Base):
     __tablename__ = "quotations"
+    __table_args__ = {'schema': 'public'}  # Añadir esto
     
     id = Column(Integer, primary_key=True, index=True)
     conversation_id = Column(Integer, nullable=False)
