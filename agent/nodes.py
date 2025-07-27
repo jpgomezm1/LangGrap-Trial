@@ -1,3 +1,5 @@
+# agent/nodes.py
+
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, AIMessage
 from agent.state import AgentState
@@ -59,162 +61,191 @@ Puedes enviarme el RUT como foto del documento o simplemente escribir el número
     return template.format(**context) if context else template
 
 def router_node(state: AgentState) -> AgentState:
-    """Nodo central de enrutamiento que decide el siguiente paso usando LLM"""
-    
-    router_prompt = f"""Eres el router central de un asistente de ventas de equipos de altura. Analiza el estado actual de la conversación y decide cuál debe ser el siguiente paso.
+    """
+    Nodo central de enrutamiento. Ahora es más inteligente para evitar atascos.
+    """
+    conversation_history = "\n".join(
+        [f"{'Cliente' if isinstance(msg, HumanMessage) else 'Asistente'}: {msg.content}" for msg in state.get('messages', [])[-6:]]
+    )
 
-ESTADO ACTUAL:
-- Etapa: {state.get('conversation_stage', 'unknown')}
-- Tiene nombre: {'Sí' if state.get('user_name') else 'No'}
-- Tiene empresa: {'Sí' if state.get('company_name') else 'No'}
-- Tiene teléfono: {'Sí' if state.get('phone') else 'No'}
-- Tiene email: {'Sí' if state.get('email') else 'No'}
-- Tiene altura: {'Sí' if state.get('project_details', {}).get('height') else 'No'}
-- Tiene duración: {'Sí' if state.get('project_details', {}).get('duration_text') else 'No'}
-- Tiene equipos recomendados: {'Sí' if state.get('recommended_equipment') else 'No'}
-- Tiene documentos RUT: {'Sí' if state.get('documents', {}).get('rut') else 'No'}
-- Cotización generada: {'Sí' if state.get('quotation_data') else 'No'}
+    # REGLA DE ORO MEJORADA: Solo termina si la última respuesta es del asistente Y el nuevo mensaje del cliente es muy corto o no aporta nada.
+    last_message_is_from_assistant = len(state['messages']) > 0 and isinstance(state['messages'][-1], AIMessage)
 
-ÚLTIMO MENSAJE: {state.get('current_message', '')}
+    if last_message_is_from_assistant:
+        state["next_node"] = "END"
+        logger.info("Router (Sebastián) decidió: END (esperando respuesta del cliente)")
+        return state
 
-OPCIONES DISPONIBLES:
-- consultation: Si necesita más información del proyecto o datos del cliente
-- analyze_requirements: Si tiene info básica del proyecto pero no ha analizado equipos
-- recommend_equipment: Si necesita recomendar o cambiar equipos
-- collect_documents: Si tiene equipos seleccionados pero faltan documentos
-- generate_quotation: Si tiene todo listo para cotizar
-- send_quotation: Si la cotización está generada pero no enviada
-- notify_commercial: Si todo está completo
-- END: Si la conversación ha terminado completamente
+    router_prompt = f"""Eres "Sebastián", el asistente de ventas experto de EquiposUp. Tu trabajo es decidir el siguiente paso en la conversación.
 
-Responde SOLO con una de las opciones exactas de arriba."""
+HISTORIAL RECIENTE:
+{conversation_history}
 
+ESTADO ACTUAL DE LA CONVERSACIÓN:
+- Cliente: {state.get('user_name', 'No')}
+- Empresa: {state.get('company_name', 'No')}
+- Contacto (teléfono, email): {'Sí' if state.get('phone') and state.get('email') else 'No'}
+- Detalles del proyecto (altura, duración, tipo): {'Sí' if all(k in state.get('project_details', {}) for k in ['height', 'duration_text', 'work_type']) else 'No'}
+- RUT Recibido: {'Sí' if state.get('documents', {}).get('rut') else 'No'}
+
+OPCIONES (siguiente nodo):
+- consultation: ¡Úsalo siempre que haya un nuevo mensaje del cliente! Este nodo procesará lo que dijo.
+- analyze_requirements: Si ya tienes los 3 detalles del proyecto.
+- collect_documents: Si el cliente ya vio las recomendaciones y quiere cotizar, pero faltan datos de contacto o el RUT.
+- generate_quotation: Si tienes absolutamente todo.
+
+¿Cuál es el siguiente paso? Responde SOLO con el nombre del nodo.
+"""
     try:
-        response = llm.invoke([{"role": "user", "content": router_prompt}])
-        next_node = response.content.strip().lower()
-        
-        # Validar que la respuesta sea válida
-        valid_nodes = ["consultation", "analyze_requirements", "recommend_equipment", 
-                      "collect_documents", "generate_quotation", "send_quotation", 
-                      "notify_commercial", "end"]
-        
-        if next_node not in valid_nodes:
-            # Fallback: decidir basado en reglas simples
-            if not state.get('project_details', {}).get('height'):
-                next_node = "consultation"
-            elif not state.get('recommended_equipment'):
-                next_node = "analyze_requirements"
-            elif not state.get('documents', {}).get('rut'):
-                next_node = "collect_documents"
-            elif not state.get('quotation_data'):
-                next_node = "generate_quotation"
-            else:
-                next_node = "notify_commercial"
-        
-        state["next_node"] = next_node.upper() if next_node == "end" else next_node
-        
-        logger.info(f"Router decidió: {state['next_node']}")
-        
+        response = llm.invoke(router_prompt)
+        next_node = response.content.strip().lower().split()[0].replace("`", "").replace("'", "").replace('"', '')
+        state["next_node"] = next_node
+        logger.info(f"Router (Sebastián) decidió: {state['next_node']}")
     except Exception as e:
-        logger.error(f"Error en router_node: {e}")
-        # Fallback conservador
-        state["next_node"] = "consultation"
-    
-    return state
-
-def welcome_node(state: AgentState) -> AgentState:
-    """Nodo de bienvenida e inicialización"""
-    
-    state["conversation_stage"] = "gathering_info"
-    state["response"] = generate_response("welcome", {})
-    state["needs_more_info"] = True
-    state["next_node"] = "consultation"
+        logger.error(f"Error en router_node: {e}", exc_info=True)
+        state["next_node"] = "END"
+        state["response"] = "¡Uy! Tuve un percance técnico. ¿Podríamos intentarlo de nuevo?"
     
     return state
 
 def consultation_node(state: AgentState) -> AgentState:
-    """Nodo consultor de necesidades con extracción de datos estructurados"""
-    
-    system_prompt = f"""Eres un consultor experto en equipos de altura de {config.COMPANY_NAME}. Analiza el mensaje del cliente y extrae información estructurada.
+    """
+    Nodo consultor con el patrón "Extraer y Responder".
+    """
+    conversation_history = "\n".join(
+        [f"{'Cliente' if isinstance(msg, HumanMessage) else 'Asistente'}: {msg.content}" for msg in state.get('messages', [])]
+    )
+    last_user_message = state.get('current_message', '')
 
-INFORMACIÓN ACTUAL:
-- Nombre: {state.get('user_name', 'No proporcionado')}
-- Empresa: {state.get('company_name', 'No proporcionada')}
-- Teléfono: {state.get('phone', 'No proporcionado')}
-- Email: {state.get('email', 'No proporcionado')}
-- Detalles del proyecto: {json.dumps(state.get('project_details', {}), ensure_ascii=False)}
+    # --- PASO 1: EXTRAER DATOS ---
+    extraction_prompt = f"""
+Analiza el último mensaje del cliente en el contexto de la conversación y extrae la siguiente información en formato JSON. Si un dato no está presente, déjalo como null.
 
-MENSAJE DEL CLIENTE: {state['current_message']}
+Conversación:
+{conversation_history}
+
+Último mensaje del cliente: "{last_user_message}"
+
+JSON a extraer:
+{{
+  "user_name": "nombre del cliente" o null,
+  "company_name": "nombre de la empresa" o null,
+  "phone": "telefono de contacto" o null,
+  "email": "email de contacto" o null,
+  "rut_text": "numero de RUT" o null,
+  "project_details": {{
+    "height": numero de metros o null,
+    "duration_text": "duracion del alquiler" o null,
+    "work_type": "tipo de trabajo" o null
+  }}
+}}
+"""
+    try:
+        # Extraer
+        response_extraction = llm.invoke(extraction_prompt)
+        extracted = json.loads(response_extraction.content.strip().replace("```json", "").replace("```", ""))
+        
+        # Actualizar estado silenciosamente
+        if extracted.get("user_name"): state["user_name"] = extracted["user_name"]
+        if extracted.get("company_name"): state["company_name"] = extracted["company_name"]
+        if extracted.get("phone"): state["phone"] = extracted["phone"]
+        if extracted.get("email"): state["email"] = extracted["email"]
+        if extracted.get("rut_text"):
+            state["documents"] = state.get("documents", {})
+            state["documents"]["rut"] = {"text": extracted["rut_text"], "received": True}
+        if "project_details" in extracted and extracted["project_details"]:
+            state["project_details"] = state.get("project_details", {})
+            state["project_details"].update(d for d in extracted["project_details"].items() if d[1] is not None)
+
+    except Exception as e:
+        logger.error(f"Error extrayendo datos en consultation_node: {e}")
+        state['response'] = "Creo que no te entendí bien, ¿me lo podrías repetir de otra forma?"
+        return state
+
+    # --- PASO 2: GENERAR RESPUESTA NATURAL ---
+    response_generation_prompt = f"""
+Eres "Sebastián" de EquiposUp, un asistente de ventas muy amigable y proactivo.
+Acabas de procesar la respuesta de un cliente. Ahora, genera una respuesta natural y útil basada en la situación actual.
+
+Situación:
+{json.dumps(state, indent=2, default=str, ensure_ascii=False)}
+
+Instrucciones:
+- **Confirma y Agradece:** Si extrajiste datos, confírmalos amablemente. (Ej: "¡Perfecto, Juan, he guardado tu número!").
+- **Pide lo que Falta:** Si aún necesitas información clave (altura, duración, tipo de trabajo), haz una pregunta conversacional para obtenerla.
+- **Transición Suave:** Si ya tienes todo para el siguiente paso (ej. recomendar equipos), anúncialo de forma natural. (Ej: "¡Genial! Con esos detalles ya puedo buscarte las mejores opciones. Dame un segundo...")
+- **Sé breve y amigable.**
+"""
+    try:
+        # Responder
+        response_generation = llm.invoke(response_generation_prompt)
+        state['response'] = response_generation.content
+        logger.info(f"Consulta procesada. Respuesta generada: {state['response'][:60]}...")
+    except Exception as e:
+        logger.error(f"Error generando respuesta en consultation_node: {e}")
+        state['response'] = "¡Entendido! ¿En qué más te puedo ayudar?"
+        
+    return state
+
+
+def consultation_node(state: AgentState) -> AgentState:
+    """
+    Nodo consultor que extrae datos y tiene una personalidad más fluida.
+    """
+    system_prompt = f"""Eres "Sebastián" de EquiposUp. Tu tono es amigable, profesional y servicial. Tu tarea actual es conversar con el cliente para entender sus necesidades y extraer información.
+
+HISTORIAL DE CONVERSACIÓN:
+{[f"{'Cliente' if isinstance(msg, HumanMessage) else 'Asistente'}: {msg.content}" for msg in state.get('messages', [])]}
 
 TAREAS:
-1. Responde de manera conversacional y profesional
-2. Extrae la siguiente información si está disponible en el mensaje:
-   - height: altura en metros (solo número)
-   - duration_text: duración original como aparece en el mensaje
-   - duration_number: número de días/semanas/meses
-   - work_type: tipo de trabajo (construcción, mantenimiento, pintura, etc.)
-   - user_name: nombre de la persona
-   - company_name: nombre de la empresa
-   - phone: número de teléfono
-   - email: email
+1.  **Extrae Información:** Del último mensaje del cliente, extrae CUALQUIER dato relevante: nombre, empresa, email, teléfono, detalles del proyecto (altura, duración, tipo de trabajo), o un número de RUT.
+2.  **Genera una Respuesta Natural:** Basado en la información que tienes y la que te falta, genera una respuesta conversacional.
+    - Si tienes todo para recomendar equipos (altura, duración, tipo de trabajo), agradécele y dile que vas a buscar las mejores opciones.
+    - Si aún falta algo, haz una pregunta clara y amigable para obtenerlo.
+    - Si te dieron datos de contacto, confírmalos amablemente. Ej: "¡Perfecto, he guardado tu número!"
 
-FORMATO DE RESPUESTA:
-Responde con un JSON que contenga:
+FORMATO DE RESPUESTA (JSON estricto):
 {{
-    "response": "tu respuesta conversacional aquí",
-    "extracted_data": {{
-        "height": número o null,
-        "duration_text": "texto" o null,
-        "duration_number": número o null,
-        "work_type": "tipo" o null,
-        "user_name": "nombre" o null,
-        "company_name": "empresa" o null,
-        "phone": "teléfono" o null,
-        "email": "email" o null
-    }},
-    "has_sufficient_info": true/false
-}}
-
-Marca has_sufficient_info como true solo si tienes altura, duración, tipo de trabajo y nombre del cliente."""
+  "response": "Tu respuesta conversacional y amigable aquí.",
+  "extracted_data": {{
+    "user_name": "nombre" o null,
+    "company_name": "empresa" o null,
+    "phone": "telefono" o null,
+    "email": "email" o null,
+    "rut_text": "numero de rut" o null,
+    "project_details": {{
+      "height": numero o null,
+      "duration_text": "texto" o null,
+      "work_type": "tipo" o null
+    }}
+  }}
+}}"""
 
     try:
-        response = llm.invoke([{"role": "user", "content": system_prompt}])
+        response = llm.invoke(system_prompt)
+        result = json.loads(response.content.strip().replace("```json", "").replace("```", ""))
         
-        # Intentar parsear JSON del LLM
-        try:
-            result = json.loads(response.content)
-        except:
-            # Fallback si el LLM no devuelve JSON válido
-            result = {
-                "response": "Entiendo tu consulta. ¿Podrías contarme un poco más sobre la altura que necesitas alcanzar y por cuánto tiempo sería el alquiler?",
-                "extracted_data": {},
-                "has_sufficient_info": False
-            }
-        
-        # Actualizar estado con datos extraídos
+        # Actualizar estado con TODOS los datos extraídos
         extracted = result.get("extracted_data", {})
-        project_details = state.get('project_details', {})
         
-        for key, value in extracted.items():
-            if value is not None:
-                if key in ['height', 'duration_text', 'duration_number', 'work_type']:
-                    project_details[key] = value
-                else:
-                    state[key] = value
-        
-        state['project_details'] = project_details
-        state['response'] = result.get("response", "¿Podrías contarme más detalles sobre tu proyecto?")
-        state['needs_more_info'] = not result.get("has_sufficient_info", False)
-        
-        if not state['needs_more_info']:
-            state['conversation_stage'] = "analyzing_requirements"
-        
-        logger.info(f"Consulta procesada - Info suficiente: {not state['needs_more_info']}")
-        
+        if extracted.get("user_name"): state["user_name"] = extracted["user_name"]
+        if extracted.get("company_name"): state["company_name"] = extracted["company_name"]
+        if extracted.get("phone"): state["phone"] = extracted["phone"]
+        if extracted.get("email"): state["email"] = extracted["email"]
+        if extracted.get("rut_text"):
+            if "documents" not in state: state["documents"] = {}
+            state["documents"]["rut"] = {"text": extracted["rut_text"], "received": True}
+
+        if "project_details" in extracted and extracted["project_details"]:
+            if "project_details" not in state: state["project_details"] = {}
+            state["project_details"].update(extracted["project_details"])
+
+        state['response'] = result.get("response", "¿Podrías darme más detalles de lo que necesitas?")
+        logger.info(f"Consulta procesada. Respuesta: {state['response'][:50]}...")
+
     except Exception as e:
-        logger.error(f"Error en consultation_node: {e}")
-        state['response'] = generate_response("clarification", {})
-        state['needs_more_info'] = True
+        logger.error(f"Error en consultation_node: {e}", exc_info=True)
+        state['response'] = "Parece que no entendí muy bien. ¿Podrías explicármelo de otra forma, por favor?"
     
     return state
 
@@ -301,27 +332,28 @@ También puedo ayudarte con la cotización si alguna te convence. 😊"""
     return state
 
 def collect_documents_node(state: AgentState) -> AgentState:
-    """Nodo recolector de documentos"""
+    """
+    Nodo recolector de documentos. Ahora es más simple y solo se activa
+    si el router detecta que, tras pedir la cotización, falta algún dato.
+    La extracción se delega al `consultation_node`.
+    """
     
-    documents = state.get('documents', {})
-    has_rut = 'rut' in documents
-    has_phone = state.get('phone') is not None
-    has_email = state.get('email') is not None
-    
-    missing_items = []
-    if not has_rut:
-        missing_items.append("📄 RUT de tu empresa")
-    if not has_phone:
-        missing_items.append("📱 Número de teléfono")
-    if not has_email:
-        missing_items.append("📧 Email de contacto")
-    
-    if missing_items:
-        missing_text = "\n".join(['• ' + item for item in missing_items])
-        state['response'] = generate_response("missing_documents", {"missing_items": missing_text})
+    # NODO DE RECOLECCIÓN SIMPLIFICADO
+    missing_items_text = []
+    if not state.get('phone'):
+        missing_items_text.append("un número de teléfono de contacto")
+    if not state.get('email'):
+        missing_items_text.append("un email para enviar la cotización")
+    if not state.get('documents', {}).get('rut'):
+        missing_items_text.append("el RUT de la empresa (puedes escribir el número o adjuntar el archivo)")
+
+    if missing_items_text:
+        missing_str = " y ".join(missing_items_text)
+        state['response'] = f"¡Claro que sí! Con gusto preparo tu cotización. Para finalizar, solo necesito que me ayudes con {missing_str}. ¡Gracias!"
     else:
-        state['response'] = "¡Excelente! Ya tengo toda la información necesaria. Procediendo a generar tu cotización..."
-        state['conversation_stage'] = "ready_for_quotation"
+        # Esto es un fallback, en teoría el router no debería llegar aquí si ya todo está completo.
+        state['response'] = "¡Perfecto! Ya tengo todo lo necesario. Estoy generando tu cotización ahora mismo..."
+        state['next_node'] = "generate_quotation" # Forzamos el siguiente paso
     
     return state
 
