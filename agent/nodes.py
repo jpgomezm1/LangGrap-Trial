@@ -110,139 +110,109 @@ OPCIONES (siguiente nodo):
 
 def consultation_node(state: AgentState) -> AgentState:
     """
-    Nodo consultor con el patrón "Extraer y Responder".
+    Gestiona la conversación consultiva con el cliente con un prompt dinámico y consciente del historial.
     """
-    conversation_history = "\n".join(
-        [f"{'Cliente' if isinstance(msg, HumanMessage) else 'Asistente'}: {msg.content}" for msg in state.get('messages', [])]
-    )
+    print("---CONSULTATION NODE---")
+    
+    # Construir el historial de la conversación
+    conversation_history = ""
+    messages = state.get('messages', [])
+    for msg in messages:
+        role = "Cliente" if isinstance(msg, HumanMessage) else "Asistente"
+        conversation_history += f"{role}: {msg.content}\n"
+    
     last_user_message = state.get('current_message', '')
+    is_first_message = len(messages) <= 1
+    
+    # --- PROMPT DINÁMICO MEJORADO ---
+    if is_first_message:
+        system_prompt = f"""
+Eres "Sebastián", un asistente de ventas experto y amigable de EquiposUp. Es el primer contacto con este cliente.
 
-    # --- PASO 1: EXTRAER DATOS ---
-    extraction_prompt = f"""
-Analiza el último mensaje del cliente en el contexto de la conversación y extrae la siguiente información en formato JSON. Si un dato no está presente, déjalo como null.
-
-Conversación:
-{conversation_history}
+**Instrucciones:**
+1. **Presentación Natural:** Preséntate de manera cálida y profesional
+2. **Pregunta Abierta:** Pregunta en qué puedes ayudar al cliente
+3. **Tono Conversacional:** Habla como un humano, no como un robot
+4. **Guía Sutil:** Si es apropiado, menciona que necesitarás algunos detalles del proyecto
 
 Último mensaje del cliente: "{last_user_message}"
 
+Responde de manera natural y amigable.
+"""
+    else:
+        system_prompt = f"""
+Eres "Sebastián", asistente de ventas de EquiposUp. Mantienes una conversación fluida con un cliente.
+
+**Historial de la conversación:**
+{conversation_history}
+
+**Estado actual:**
+- Cliente: {state.get('user_name', 'No identificado')}
+- Empresa: {state.get('company_name', 'No especificada')}
+- Proyecto: {state.get('project_details', {})}
+
+**Instrucciones:**
+1. **Continuidad:** Usa el contexto del historial para responder coherentemente
+2. **Extracción:** Identifica y confirma cualquier información nueva (nombre, empresa, altura, duración, tipo de trabajo, teléfono, email, RUT)
+3. **Progreso Natural:** Si tienes suficiente información para el siguiente paso, guía naturalmente hacia allá
+4. **Una Pregunta:** Haz máximo una pregunta clara por respuesta
+5. **Evita Repetición:** No repitas saludos o información ya confirmada
+
+Último mensaje del cliente: "{last_user_message}"
+
+Genera una respuesta que extraiga información relevante y mantenga la conversación fluida.
+"""
+
+    try:
+        # Llamada al LLM con el prompt dinámico
+        response = llm.invoke(system_prompt)
+        
+        # Extraer información del mensaje actual
+        extraction_prompt = f"""
+Analiza este mensaje del cliente y extrae información relevante en formato JSON:
+"{last_user_message}"
+
 JSON a extraer:
 {{
-  "user_name": "nombre del cliente" o null,
-  "company_name": "nombre de la empresa" o null,
-  "phone": "telefono de contacto" o null,
-  "email": "email de contacto" o null,
+  "user_name": "nombre" o null,
+  "company_name": "empresa" o null,
+  "phone": "telefono" o null,
+  "email": "email" o null,
   "rut_text": "numero de RUT" o null,
   "project_details": {{
-    "height": numero de metros o null,
-    "duration_text": "duracion del alquiler" o null,
+    "height": numero o null,
+    "duration_text": "duracion" o null,
     "work_type": "tipo de trabajo" o null
   }}
 }}
 """
-    try:
-        # Extraer
-        response_extraction = llm.invoke(extraction_prompt)
-        extracted = json.loads(response_extraction.content.strip().replace("```json", "").replace("```", ""))
         
-        # Actualizar estado silenciosamente
-        if extracted.get("user_name"): state["user_name"] = extracted["user_name"]
-        if extracted.get("company_name"): state["company_name"] = extracted["company_name"]
-        if extracted.get("phone"): state["phone"] = extracted["phone"]
-        if extracted.get("email"): state["email"] = extracted["email"]
-        if extracted.get("rut_text"):
-            state["documents"] = state.get("documents", {})
-            state["documents"]["rut"] = {"text": extracted["rut_text"], "received": True}
-        if "project_details" in extracted and extracted["project_details"]:
-            state["project_details"] = state.get("project_details", {})
-            state["project_details"].update(d for d in extracted["project_details"].items() if d[1] is not None)
-
-    except Exception as e:
-        logger.error(f"Error extrayendo datos en consultation_node: {e}")
-        state['response'] = "Creo que no te entendí bien, ¿me lo podrías repetir de otra forma?"
-        return state
-
-    # --- PASO 2: GENERAR RESPUESTA NATURAL ---
-    response_generation_prompt = f"""
-Eres "Sebastián" de EquiposUp, un asistente de ventas muy amigable y proactivo.
-Acabas de procesar la respuesta de un cliente. Ahora, genera una respuesta natural y útil basada en la situación actual.
-
-Situación:
-{json.dumps(state, indent=2, default=str, ensure_ascii=False)}
-
-Instrucciones:
-- **Confirma y Agradece:** Si extrajiste datos, confírmalos amablemente. (Ej: "¡Perfecto, Juan, he guardado tu número!").
-- **Pide lo que Falta:** Si aún necesitas información clave (altura, duración, tipo de trabajo), haz una pregunta conversacional para obtenerla.
-- **Transición Suave:** Si ya tienes todo para el siguiente paso (ej. recomendar equipos), anúncialo de forma natural. (Ej: "¡Genial! Con esos detalles ya puedo buscarte las mejores opciones. Dame un segundo...")
-- **Sé breve y amigable.**
-"""
-    try:
-        # Responder
-        response_generation = llm.invoke(response_generation_prompt)
-        state['response'] = response_generation.content
-        logger.info(f"Consulta procesada. Respuesta generada: {state['response'][:60]}...")
-    except Exception as e:
-        logger.error(f"Error generando respuesta en consultation_node: {e}")
-        state['response'] = "¡Entendido! ¿En qué más te puedo ayudar?"
+        # Extraer datos
+        try:
+            extraction_response = llm.invoke(extraction_prompt)
+            extracted = json.loads(extraction_response.content.strip().replace("```json", "").replace("```", ""))
+            
+            # Actualizar estado con los datos extraídos
+            if extracted.get("user_name"): state["user_name"] = extracted["user_name"]
+            if extracted.get("company_name"): state["company_name"] = extracted["company_name"]
+            if extracted.get("phone"): state["phone"] = extracted["phone"]
+            if extracted.get("email"): state["email"] = extracted["email"]
+            if extracted.get("rut_text"):
+                if "documents" not in state: state["documents"] = {}
+                state["documents"]["rut"] = {"text": extracted["rut_text"], "received": True}
+            
+            if "project_details" in extracted and extracted["project_details"]:
+                if "project_details" not in state: state["project_details"] = {}
+                for key, value in extracted["project_details"].items():
+                    if value is not None:
+                        state["project_details"][key] = value
+                        
+        except Exception as e:
+            logger.error(f"Error extrayendo datos: {e}")
         
-    return state
-
-
-def consultation_node(state: AgentState) -> AgentState:
-    """
-    Nodo consultor que extrae datos y tiene una personalidad más fluida.
-    """
-    system_prompt = f"""Eres "Sebastián" de EquiposUp. Tu tono es amigable, profesional y servicial. Tu tarea actual es conversar con el cliente para entender sus necesidades y extraer información.
-
-HISTORIAL DE CONVERSACIÓN:
-{[f"{'Cliente' if isinstance(msg, HumanMessage) else 'Asistente'}: {msg.content}" for msg in state.get('messages', [])]}
-
-TAREAS:
-1.  **Extrae Información:** Del último mensaje del cliente, extrae CUALQUIER dato relevante: nombre, empresa, email, teléfono, detalles del proyecto (altura, duración, tipo de trabajo), o un número de RUT.
-2.  **Genera una Respuesta Natural:** Basado en la información que tienes y la que te falta, genera una respuesta conversacional.
-    - Si tienes todo para recomendar equipos (altura, duración, tipo de trabajo), agradécele y dile que vas a buscar las mejores opciones.
-    - Si aún falta algo, haz una pregunta clara y amigable para obtenerlo.
-    - Si te dieron datos de contacto, confírmalos amablemente. Ej: "¡Perfecto, he guardado tu número!"
-
-FORMATO DE RESPUESTA (JSON estricto):
-{{
-  "response": "Tu respuesta conversacional y amigable aquí.",
-  "extracted_data": {{
-    "user_name": "nombre" o null,
-    "company_name": "empresa" o null,
-    "phone": "telefono" o null,
-    "email": "email" o null,
-    "rut_text": "numero de rut" o null,
-    "project_details": {{
-      "height": numero o null,
-      "duration_text": "texto" o null,
-      "work_type": "tipo" o null
-    }}
-  }}
-}}"""
-
-    try:
-        response = llm.invoke(system_prompt)
-        result = json.loads(response.content.strip().replace("```json", "").replace("```", ""))
-        
-        # Actualizar estado con TODOS los datos extraídos
-        extracted = result.get("extracted_data", {})
-        
-        if extracted.get("user_name"): state["user_name"] = extracted["user_name"]
-        if extracted.get("company_name"): state["company_name"] = extracted["company_name"]
-        if extracted.get("phone"): state["phone"] = extracted["phone"]
-        if extracted.get("email"): state["email"] = extracted["email"]
-        if extracted.get("rut_text"):
-            if "documents" not in state: state["documents"] = {}
-            state["documents"]["rut"] = {"text": extracted["rut_text"], "received": True}
-
-        if "project_details" in extracted and extracted["project_details"]:
-            if "project_details" not in state: state["project_details"] = {}
-            state["project_details"].update(extracted["project_details"])
-
-        state['response'] = result.get("response", "¿Podrías darme más detalles de lo que necesitas?")
+        state['response'] = response.content
         logger.info(f"Consulta procesada. Respuesta: {state['response'][:50]}...")
-
+        
     except Exception as e:
         logger.error(f"Error en consultation_node: {e}", exc_info=True)
         state['response'] = "Parece que no entendí muy bien. ¿Podrías explicármelo de otra forma, por favor?"
@@ -357,8 +327,44 @@ def collect_documents_node(state: AgentState) -> AgentState:
     
     return state
 
+def process_rut_node(state: AgentState) -> AgentState:
+    """
+    Procesa el archivo RUT (PDF) para extraer la información del cliente.
+    """
+    print("---PROCESS RUT NODE---")
+    file_path = state.get("document_path") # Asumimos que la ruta del PDF se guarda en el estado
+
+    if not file_path:
+        # Si no hay documento, pide al usuario que lo envíe
+        message = "¡Entendido! Para generar la cotización, necesito que por favor me envíes el RUT de la empresa en formato PDF."
+        state['response'] = message
+        return state
+
+    try:
+        # Llama a la herramienta para procesar el PDF
+        from agent.tools import process_rut_with_gemini
+        client_info = process_rut_with_gemini(file_path) # Esta herramienta usa Gemini Vision
+        
+        # Actualiza el estado con la información extraída
+        state['client_info'] = client_info
+        print(f"Información del RUT procesada: {client_info}")
+
+        message = f"¡Perfecto! He procesado el RUT. Veo que la empresa es {client_info.get('company_name')}. Ahora, procederé a generar la cotización."
+        state['response'] = message
+        
+    except Exception as e:
+        print(f"Error al procesar el RUT: {e}")
+        logger.error(f"Error al procesar el RUT: {e}")
+        message = "Tuve un problema al leer el documento. ¿Podrías intentar enviarlo de nuevo, por favor?"
+        state['response'] = message
+    
+    return state
+
 def generate_quotation_node(state: AgentState) -> AgentState:
-    """Nodo generador de cotización"""
+    """
+    Genera el PDF de la cotización y lo prepara para el envío.
+    """
+    print("---GENERATE QUOTATION NODE---")
     
     try:
         recommended_equipment = state.get('recommended_equipment', [])
@@ -381,11 +387,22 @@ def generate_quotation_node(state: AgentState) -> AgentState:
         # Calcular cotización
         equipment_ids = [eq['id'] for eq in recommended_equipment]
         
-        from agent.tools import CalculateQuotationTool
+        from agent.tools import CalculateQuotationTool, generate_quotation_pdf
         quotation_tool = CalculateQuotationTool()
         
         quotation_data = quotation_tool._run(equipment_ids, rental_days)
         quotation = json.loads(quotation_data)
+        
+        # Generar PDF de la cotización
+        quotation_path = generate_quotation_pdf(
+            client_info=state.get('client_info', {}),
+            recommended_equipment=state['recommended_equipment'],
+            quotation_data=quotation,
+            project_details=project_details
+        )
+        
+        # Guarda la ruta del PDF de la cotización en el estado
+        state['quotation_pdf_path'] = quotation_path
         
         # Generar mensaje de cotización
         quotation_message = f"""🎉 **Cotización Generada - {config.COMPANY_NAME}**
@@ -418,9 +435,7 @@ def generate_quotation_node(state: AgentState) -> AgentState:
 ✅ Capacitación básica incluida
 ✅ Soporte técnico 24/7
 
-¡Excelente elección! Un miembro de nuestro equipo comercial se pondrá en contacto contigo pronto para coordinar los detalles. 
-
-¿Tienes alguna pregunta sobre esta cotización? 🚀"""
+¡Listo! He generado tu cotización en PDF. Te la enviaré en un momento."""
         
         state['quotation_data'] = quotation
         state['response'] = quotation_message
@@ -431,15 +446,37 @@ def generate_quotation_node(state: AgentState) -> AgentState:
         
     except Exception as e:
         logger.error(f"Error generando cotización: {e}")
-        state['response'] = generate_response("error", {})
-    
+        state['response'] = "Hubo un error al crear el documento de la cotización. Estoy notificando al equipo para que te ayude."
+        
     return state
 
 def send_quotation_node(state: AgentState) -> AgentState:
-    """Nodo enviador de cotización"""
+    """
+    Envía la cotización al cliente y notifica al equipo comercial.
+    Este nodo ahora también se encarga de enviar el PDF.
+    """
+    print("---SEND QUOTATION NODE---")
+    user_id = state.get('user_id')
+    quotation_pdf_path = state.get("quotation_pdf_path")
     
-    state['quotation_sent'] = True
-    state['conversation_stage'] = "quotation_sent"
+    if not quotation_pdf_path:
+        print("Error: No se encontró la ruta del PDF de la cotización en el estado.")
+        logger.error("No se encontró la ruta del PDF de la cotización en el estado.")
+        state['response'] = "Hubo un problema generando el documento. Nuestro equipo comercial se pondrá en contacto contigo."
+        return state
+
+    # Prepara el mensaje final para el usuario
+    final_message = "Te he enviado la cotización a tu correo y también adjunta aquí en el chat. Si tienes alguna otra pregunta, no dudes en consultarme."
+    
+    # La responsabilidad de enviar el mensaje y el documento por Telegram
+    # se delega al servicio de Telegram para mantener los nodos agnósticos a la plataforma.
+    # Guardamos la ruta del PDF y el mensaje en el estado para que el servicio de Telegram los use.
+    state['response_type'] = 'document'
+    state['document_to_send'] = quotation_pdf_path
+    state['final_message'] = final_message
+    state['response'] = final_message
+    
+    print(f"Preparado para enviar cotización en PDF a {user_id}: {quotation_pdf_path}")
     
     # Guardar en base de datos
     try:
@@ -453,15 +490,18 @@ def send_quotation_node(state: AgentState) -> AgentState:
             "email": state.get('email'),
             "project_details": state.get('project_details'),
             "recommended_equipment": state.get('recommended_equipment'),
-            "stage": state['conversation_stage'],
+            "stage": state.get('conversation_stage', 'quotation_sent'),
             "quotation_sent": True
         }
         
-        save_tool._run(state['user_id'], conversation_data)
-        logger.info(f"Conversación guardada para usuario {state['user_id']}")
+        save_tool._run(state.get('user_id'), conversation_data)
+        logger.info(f"Conversación guardada para usuario {state.get('user_id')}")
         
     except Exception as e:
         logger.error(f"Error guardando conversación: {e}")
+    
+    state['quotation_sent'] = True
+    state['conversation_stage'] = "quotation_sent"
     
     return state
 

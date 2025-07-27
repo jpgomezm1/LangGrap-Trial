@@ -5,6 +5,18 @@ from sqlalchemy.orm import Session
 from database.connection import SessionLocal
 from database.models import Equipment, Conversation, Quotation
 import json
+import os
+import google.generativeai as genai
+import fitz  # PyMuPDF
+from PIL import Image
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.units import inch
+from datetime import datetime
+
+# Configura la API de Gemini (asumiendo que ya tienes la key en tus variables de entorno)
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+genai.configure(api_key=GOOGLE_API_KEY)
 
 class GetEquipmentArgs(BaseModel):
     """Argumentos para la herramienta GetEquipment"""
@@ -183,6 +195,203 @@ class ValidateDocumentTool(BaseTool):
             return "El RUT no puede tener más de 15 caracteres"
         
         return "Documento válido"
+
+def process_rut_with_gemini(pdf_path: str) -> dict:
+    """
+    Extrae información de un archivo RUT en formato PDF utilizando Gemini Vision.
+
+    Args:
+        pdf_path: La ruta local al archivo PDF del RUT.
+
+    Returns:
+        Un diccionario con la información extraída (ej. company_name, nit).
+    """
+    print(f"🛠️ Procesando RUT desde: {pdf_path}")
+    
+    try:
+        # Configuración del modelo Gemini Vision
+        model = genai.GenerativeModel('gemini-1.5-pro-latest')
+
+        # Abrir el PDF
+        doc = fitz.open(pdf_path)
+        
+        image_parts = []
+        for page_num in range(len(doc)):
+            page = doc.load_page(page_num)
+            pix = page.get_pixmap()
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            image_parts.append(img)
+
+        # Prompt para guiar al modelo en la extracción de datos
+        prompt_parts = [
+            "Analiza la siguiente imagen de un RUT (Registro Único Tributario) de Colombia.",
+            "Extrae la siguiente información en formato JSON estricto:",
+            "- Razon Social (clave: 'company_name')",
+            "- NIT (Número de Identificación Tributaria) (clave: 'nit')",
+            "- Direccion Principal (clave: 'address')",
+            "- Correo Electronico de Notificacion (clave: 'email')",
+            "- Responsabilidades Tributarias (clave: 'responsibilities'), debe ser una lista de strings.",
+            "Si un campo no se encuentra, su valor debe ser null.",
+            *image_parts, # Añade las imágenes al prompt
+        ]
+
+        # Llamada al modelo
+        response = model.generate_content(prompt_parts)
+        
+        # Limpiar y parsear la respuesta
+        # Gemini a veces devuelve el JSON dentro de un bloque de código markdown
+        clean_response = response.text.replace("```json", "").replace("```", "").strip()
+        client_info = json.loads(clean_response)
+        
+        print(f"✅ Información del RUT extraída: {client_info}")
+        return client_info
+
+    except Exception as e:
+        print(f"❌ Error al procesar el RUT con Gemini: {e}")
+        return {"error": str(e)}
+
+def generate_quotation_pdf(client_info: dict, recommended_equipment: list, quotation_data: dict = None, project_details: dict = None, quotation_id: str = None) -> str:
+    """
+    Genera un archivo PDF para la cotización.
+
+    Args:
+        client_info: Diccionario con la información del cliente (extraída del RUT).
+        recommended_equipment: Lista de diccionarios con los equipos recomendados.
+        quotation_data: Datos de la cotización calculada.
+        project_details: Detalles del proyecto.
+        quotation_id: Un identificador único para la cotización.
+
+    Returns:
+        La ruta al archivo PDF generado.
+    """
+    if not quotation_id:
+        quotation_id = f"COT-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    
+    file_path = f"cotizacion_{quotation_id}.pdf"
+    print(f"📄 Creando cotización en PDF: {file_path}")
+
+    try:
+        c = canvas.Canvas(file_path, pagesize=letter)
+        width, height = letter
+
+        # --- Cabecera ---
+        # Asumiendo que tienes un logo en la misma carpeta
+        if os.path.exists("logo.png"):
+            c.drawImage("logo.png", 50, height - 100, width=150, preserveAspectRatio=True)
+        
+        c.setFont("Helvetica-Bold", 16)
+        c.drawRightString(width - 50, height - 70, "COTIZACIÓN")
+        c.setFont("Helvetica", 12)
+        c.drawRightString(width - 50, height - 90, f"Nro: {quotation_id}")
+        c.drawRightString(width - 50, height - 110, f"Fecha: {datetime.now().strftime('%Y-%m-%d')}")
+
+        # --- Información del Cliente ---
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(50, height - 150, "Cliente:")
+        c.setFont("Helvetica", 11)
+        text = c.beginText(50, height - 170)
+        text.textLine(f"Razón Social: {client_info.get('company_name', 'N/A')}")
+        text.textLine(f"NIT: {client_info.get('nit', 'N/A')}")
+        text.textLine(f"Dirección: {client_info.get('address', 'N/A')}")
+        text.textLine(f"Email: {client_info.get('email', 'N/A')}")
+        c.drawText(text)
+
+        # --- Información del Proyecto ---
+        if project_details:
+            c.setFont("Helvetica-Bold", 12)
+            c.drawString(50, height - 230, "Detalles del Proyecto:")
+            c.setFont("Helvetica", 11)
+            text = c.beginText(50, height - 250)
+            text.textLine(f"Altura requerida: {project_details.get('height', 'N/A')} metros")
+            text.textLine(f"Tipo de trabajo: {project_details.get('work_type', 'N/A')}")
+            text.textLine(f"Duración: {project_details.get('duration_text', 'N/A')}")
+            c.drawText(text)
+            table_start_y = height - 320
+        else:
+            table_start_y = height - 250
+
+        # --- Tabla de Equipos ---
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(50, table_start_y, "Detalle de Equipos Cotizados")
+        
+        y_position = table_start_y - 30
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(55, y_position, "Equipo")
+        c.drawString(300, y_position, "Precio Unitario (Día)")
+        c.drawString(450, y_position, "Total")
+        c.line(50, y_position - 5, width - 50, y_position - 5)
+        
+        c.setFont("Helvetica", 10)
+        y_position -= 20
+        
+        # Usar datos de quotation_data si están disponibles, sino usar recommended_equipment
+        if quotation_data and 'equipment_details' in quotation_data:
+            equipment_list = quotation_data['equipment_details']
+            total_cotizacion = quotation_data.get('total_amount', 0)
+            subtotal = quotation_data.get('subtotal', 0)
+            tax = quotation_data.get('tax', 0)
+        else:
+            equipment_list = recommended_equipment
+            total_cotizacion = 0
+            for item in equipment_list:
+                days = item.get('rental_days', item.get('days', 1))
+                price_per_day = item.get('daily_price', item.get('price_per_day', 0))
+                total_cotizacion += price_per_day * days
+            subtotal = total_cotizacion
+            tax = total_cotizacion * 0.19
+            total_cotizacion = subtotal + tax
+
+        for item in equipment_list:
+            name = item.get('name', 'Equipo no especificado')
+            price_per_day = item.get('daily_price', item.get('price_per_day', 0))
+            total_item = item.get('calculated_price', price_per_day * item.get('rental_days', item.get('days', 1)))
+            
+            c.drawString(55, y_position, name)
+            c.drawString(300, y_position, f"${price_per_day:,.0f}")
+            c.drawString(450, y_position, f"${total_item:,.0f}")
+            y_position -= 15
+
+        # --- Totales ---
+        c.line(50, y_position, width - 50, y_position)
+        y_position -= 20
+        
+        c.setFont("Helvetica", 10)
+        c.drawRightString(width - 150, y_position, "Subtotal:")
+        c.drawRightString(width - 50, y_position, f"${subtotal:,.0f}")
+        y_position -= 15
+        
+        c.drawRightString(width - 150, y_position, "IVA (19%):")
+        c.drawRightString(width - 50, y_position, f"${tax:,.0f}")
+        y_position -= 15
+        
+        c.setFont("Helvetica-Bold", 12)
+        c.drawRightString(width - 150, y_position, "Total Cotización:")
+        c.drawRightString(width - 50, y_position, f"${total_cotizacion:,.0f}")
+        
+        # --- Condiciones ---
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(50, y_position - 40, "Condiciones:")
+        c.setFont("Helvetica", 9)
+        conditions_text = c.beginText(50, y_position - 55)
+        conditions_text.textLine("• Precios válidos por 15 días")
+        conditions_text.textLine("• Incluye entrega y recogida en Bogotá")
+        conditions_text.textLine("• Capacitación básica incluida")
+        conditions_text.textLine("• Soporte técnico 24/7")
+        conditions_text.textLine("• Precios sujetos a disponibilidad")
+        c.drawText(conditions_text)
+        
+        # --- Pie de página ---
+        c.setFont("Helvetica-Oblique", 9)
+        c.drawString(50, 50, "Cotización válida por 15 días. Precios no incluyen IVA.")
+        c.drawRightString(width - 50, 50, "EquiposUp - Equipos de Altura")
+
+        c.save()
+        print(f"✅ Cotización guardada en: {file_path}")
+        return file_path
+    
+    except Exception as e:
+        print(f"❌ Error generando el PDF de la cotización: {e}")
+        return None
 
 def get_agent_tools():
     """Retorna lista de herramientas disponibles para el agente"""
