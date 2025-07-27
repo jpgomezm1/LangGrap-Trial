@@ -8,19 +8,23 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class Settings(BaseSettings):
-    """Configuración de la aplicación usando Pydantic Settings"""
+    """Configuración de la aplicación usando Pydantic Settings optimizada para reducir uso de tokens"""
     
     # Configuración de Telegram
     TELEGRAM_TOKEN: str = Field(..., description="Token del bot de Telegram")
     
-    # Configuración de Google AI
+    # Configuración de Google AI optimizada
     GOOGLE_API_KEY: str = Field(..., description="API Key de Google Generative AI")
     MODEL_NAME: str = Field(default="gemini-1.5-flash", description="Nombre del modelo de Gemini")
-    TEMPERATURE: float = Field(default=0.7, description="Temperatura del modelo")
-    MAX_TOKENS: int = Field(default=1000, description="Máximo número de tokens")
+    TEMPERATURE: float = Field(default=0.3, description="Temperatura del modelo - reducida para consistencia")
+    MAX_TOKENS: int = Field(default=300, description="Máximo número de tokens - reducido para ahorrar cuota")
+    
+    # Configuración de rate limiting para evitar exceder cuota
+    REQUEST_DELAY: float = Field(default=0.8, description="Delay entre requests en segundos")
+    MAX_RETRIES: int = Field(default=3, description="Máximo número de reintentos")
+    RETRY_DELAY: int = Field(default=60, description="Delay base para reintentos en segundos")
     
     # Configuración de base de datos
-    # --- MODIFICAR ESTA LÍNEA ---
     DATABASE_URL: str = Field(default=os.getenv("DATABASE_URL", "postgresql://neondb_owner:npg_Uduk4FqGZbn1@ep-cold-snow-adtfewzz-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require"), description="URL de la base de datos")
     
     # Configuración de la empresa
@@ -28,7 +32,7 @@ class Settings(BaseSettings):
     COMPANY_EMAIL: str = Field(default="ventas@equiposup.com", description="Email de la empresa")
     COMPANY_PHONE: str = Field(default="+57 300 123 4567", description="Teléfono de la empresa")
     
-    # --- AÑADIR ESTA LÍNEA ---
+    # Configuración del dominio
     COMPANY_DOMAIN: str = Field(default="updates.stayirrelevant.com", description="Dominio de la empresa para enviar correos")
     
     # Configuración de email (Resend) - opcional
@@ -41,6 +45,11 @@ class Settings(BaseSettings):
     # Configuración de desarrollo
     DEBUG: bool = Field(default=False, description="Modo debug")
     
+    # Nuevas configuraciones para optimización
+    USE_CACHE: bool = Field(default=True, description="Usar cache para conversaciones")
+    SIMPLE_EXTRACTION: bool = Field(default=True, description="Usar extracción simple sin LLM cuando sea posible")
+    QUOTA_SAFETY: bool = Field(default=True, description="Activar medidas de seguridad para la cuota")
+    
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
@@ -49,7 +58,7 @@ class Settings(BaseSettings):
         
         @classmethod
         def parse_env_var(cls, field_name: str, raw_val: str) -> any:
-            if field_name == 'DEBUG':
+            if field_name in ['DEBUG', 'USE_CACHE', 'SIMPLE_EXTRACTION', 'QUOTA_SAFETY']:
                 return raw_val.lower() in ('true', '1', 'yes', 'on')
             return raw_val
 
@@ -78,6 +87,9 @@ def validate_config():
     print(f"🏢 Empresa: {config.COMPANY_NAME}")
     print(f"🌐 Dominio: {config.COMPANY_DOMAIN}")
     print(f"🤖 Modelo: {config.MODEL_NAME}")
+    print(f"⚡ Max tokens: {config.MAX_TOKENS} (optimizado)")
+    print(f"🛡️ Rate limiting: {config.REQUEST_DELAY}s delay")
+    print(f"🔄 Quota safety: {'Activado' if config.QUOTA_SAFETY else 'Desactivado'}")
     
     return True
 

@@ -8,53 +8,146 @@ from services.email_service import EmailService
 from config import config
 import json
 import logging
+import time
+import re
 
 logger = logging.getLogger(__name__)
 
-# Inicializar el modelo Gemini
+# Inicializar el modelo Gemini con configuración optimizada
 llm = ChatGoogleGenerativeAI(
     model=config.MODEL_NAME,
     google_api_key=config.GOOGLE_API_KEY,
-    temperature=config.TEMPERATURE,
-    max_tokens=config.MAX_TOKENS
+    temperature=0.3,  # Reducido para ser más consistente
+    max_tokens=300,   # Reducido para ahorrar tokens
 )
 
 # Inicializar servicio de email
 email_service = EmailService()
 
+def rate_limit_delay():
+    """Añade un pequeño delay para evitar exceder la cuota"""
+    time.sleep(0.8)  # 800ms delay entre llamadas
+
+def safe_llm_invoke(prompt, max_retries=3):
+    """Invoca el LLM de forma segura con manejo de errores y reintentos"""
+    for attempt in range(max_retries):
+        try:
+            rate_limit_delay()  # Delay preventivo
+            response = llm.invoke(prompt)
+            return response
+        except Exception as e:
+            if "429" in str(e) or "quota" in str(e).lower():
+                wait_time = min(60 * (attempt + 1), 300)  # Espera progresiva hasta 5 min
+                logger.warning(f"Cuota excedida, esperando {wait_time}s antes del intento {attempt + 1}")
+                time.sleep(wait_time)
+                continue
+            else:
+                logger.error(f"Error en LLM (intento {attempt + 1}): {e}")
+                if attempt == max_retries - 1:
+                    raise e
+                time.sleep(2)  # Espera 2s antes del siguiente intento
+    
+    raise Exception("Se agotaron los reintentos para el LLM")
+
+def extract_info_simple(message):
+    """Extracción simple de información sin usar LLM"""
+    message_lower = message.lower()
+    extracted = {
+        "user_name": None,
+        "company_name": None,
+        "phone": None,
+        "email": None,
+        "rut_text": None,
+        "project_details": {
+            "height": None,
+            "duration_text": None,
+            "work_type": None
+        }
+    }
+    
+    # Buscar alturas (números seguidos de "metros", "m", "pisos", "plantas")
+    height_patterns = [
+        r'(\d+)\s*(?:metros?|m\b)',
+        r'(\d+)\s*(?:pisos?|plantas?)',
+        r'altura.*?(\d+)',
+        r'(\d+)\s*(?:de altura|alto)'
+    ]
+    
+    for pattern in height_patterns:
+        match = re.search(pattern, message_lower)
+        if match:
+            try:
+                height = int(match.group(1))
+                if height > 50:  # Si es muy alto, probablemente sean plantas
+                    height = height * 3  # Aproximadamente 3m por planta
+                extracted["project_details"]["height"] = height
+                break
+            except:
+                pass
+    
+    # Buscar duración
+    duration_patterns = [
+        r'(\d+)\s*(?:días?|day)',
+        r'(\d+)\s*(?:semanas?|week)',
+        r'(\d+)\s*(?:meses?|month)',
+        r'(\d+)\s*(?:años?|year)'
+    ]
+    
+    for pattern in duration_patterns:
+        match = re.search(pattern, message_lower)
+        if match:
+            extracted["project_details"]["duration_text"] = match.group(0)
+            break
+    
+    # Buscar tipo de trabajo
+    if any(word in message_lower for word in ['limpi', 'clean']):
+        extracted["project_details"]["work_type"] = "limpieza"
+    elif any(word in message_lower for word in ['manten', 'repair']):
+        extracted["project_details"]["work_type"] = "mantenimiento"
+    elif any(word in message_lower for word in ['construc', 'build']):
+        extracted["project_details"]["work_type"] = "construcción"
+    elif any(word in message_lower for word in ['pintu', 'paint']):
+        extracted["project_details"]["work_type"] = "pintura"
+    
+    # Buscar emails
+    email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+    email_match = re.search(email_pattern, message)
+    if email_match:
+        extracted["email"] = email_match.group(0)
+    
+    # Buscar teléfonos
+    phone_pattern = r'(?:\+57\s?)?(?:3\d{2}|[1-8]\d{2})\s?\d{3}\s?\d{4}'
+    phone_match = re.search(phone_pattern, message)
+    if phone_match:
+        extracted["phone"] = phone_match.group(0)
+    
+    return extracted
+
 def generate_response(template_name: str, context: dict) -> str:
     """Función utilitaria para generar respuestas consistentes"""
     templates = {
-        "welcome": f"""¡Hola! Soy el asistente virtual de {config.COMPANY_NAME} 👋
+        "welcome": f"""¡Hola! Soy Sebastián, tu asistente de {config.COMPANY_NAME} 👋
 
-Estoy aquí para ayudarte a encontrar el equipo de altura perfecto para tu proyecto y generar una cotización personalizada.
+Estoy aquí para ayudarte a encontrar el equipo de altura perfecto para tu proyecto.
 
-Para empezar, me gustaría conocerte un poco mejor. ¿Podrías contarme:
-- ¿Cuál es tu nombre?
-- ¿De qué empresa eres?
-- ¿En qué tipo de proyecto vas a trabajar?
-
-¡Cuéntame todo lo que consideres relevante! 😊""",
+¿Podrías contarme qué tipo de trabajo necesitas realizar y a qué altura? 😊""",
         
-        "clarification": """No estoy seguro de entender completamente tu solicitud. ¿Podrías ayudarme proporcionando más detalles sobre:
-
-- ¿Qué altura necesitas alcanzar?
+        "clarification": """¿Podrías darme más detalles sobre:
+- ¿A qué altura necesitas trabajar?
 - ¿Qué tipo de trabajo vas a realizar?
-- ¿Por cuánto tiempo necesitas el equipo?
+- ¿Por cuánto tiempo lo necesitas?
 
 Esto me ayudará a recomendarte la mejor opción. 😊""",
         
-        "missing_documents": """¡Perfecto! Me alegra que te interesen nuestros equipos. 
-
-Para generar tu cotización oficial necesito algunos datos adicionales:
+        "missing_documents": """¡Perfecto! Para generar tu cotización necesito:
 
 {missing_items}
 
-Puedes enviarme el RUT como foto del documento o simplemente escribir el número. Para el teléfono y email, solo escríbelos en el mensaje.
-
 ¿Con cuál prefieres empezar? 😊""",
         
-        "error": "Disculpa, tuve un problema procesando tu solicitud. ¿Podrías intentar de nuevo con más detalles?"
+        "error": "Disculpa, tuve un problema. ¿Podrías darme más detalles sobre tu proyecto?",
+        
+        "quota_exceeded": "Disculpa, estoy procesando muchas consultas. Dame un momento y vuelve a intentarlo en unos minutos. 😊"
     }
     
     template = templates.get(template_name, templates["error"])
@@ -62,7 +155,7 @@ Puedes enviarme el RUT como foto del documento o simplemente escribir el número
 
 def router_node(state: AgentState) -> AgentState:
     """
-    Nodo central de enrutamiento rediseñado con lógica explícita y priorizada.
+    Nodo central de enrutamiento optimizado con lógica más simple.
     """
     print("---ROUTER NODE---")
     messages = state['messages']
@@ -99,54 +192,27 @@ def router_node(state: AgentState) -> AgentState:
         logger.info("Router: PDF listo, enviando cotización")
         return state
 
-    # 4. REGLA DE ORO MEJORADA: Solo termina si la última respuesta es del asistente Y el nuevo mensaje del cliente es muy corto o no aporta nada.
-    last_message_is_from_assistant = len(messages) > 0 and isinstance(messages[-1], AIMessage)
-
-    if last_message_is_from_assistant:
+    # 4. Si el último mensaje es del asistente, esperar
+    if len(messages) > 0 and isinstance(messages[-1], AIMessage):
         state["next_node"] = "END"
         logger.info("Router: Esperando respuesta del cliente")
         return state
 
-    # Lógica basada en LLM como respaldo
-    conversation_history = "\n".join(
-        [f"{'Cliente' if isinstance(msg, HumanMessage) else 'Asistente'}: {msg.content}" for msg in messages[-6:]]
-    )
+    # 5. Si tenemos suficiente información del proyecto, analizar
+    project_details = state.get('project_details', {})
+    if project_details.get('height') and project_details.get('work_type'):
+        state["next_node"] = "analyze_requirements"
+        logger.info("Router: Información completa, analizando requisitos")
+        return state
 
-    router_prompt = f"""Eres "Sebastián", el asistente de ventas experto de EquiposUp. Tu trabajo es decidir el siguiente paso en la conversación.
-
-HISTORIAL RECIENTE:
-{conversation_history}
-
-ESTADO ACTUAL DE LA CONVERSACIÓN:
-- Cliente: {state.get('user_name', 'No')}
-- Empresa: {state.get('company_name', 'No')}
-- Contacto (teléfono, email): {'Sí' if state.get('phone') and state.get('email') else 'No'}
-- Detalles del proyecto (altura, duración, tipo): {'Sí' if all(k in state.get('project_details', {}) for k in ['height', 'duration_text', 'work_type']) else 'No'}
-- RUT Recibido: {'Sí' if state.get('documents', {}).get('rut') else 'No'}
-
-OPCIONES (siguiente nodo):
-- consultation: ¡Úsalo siempre que haya un nuevo mensaje del cliente! Este nodo procesará lo que dijo.
-- analyze_requirements: Si ya tienes los 3 detalles del proyecto.
-- collect_documents: Si el cliente ya vio las recomendaciones y quiere cotizar, pero faltan datos de contacto o el RUT.
-- generate_quotation: Si tienes absolutamente todo.
-
-¿Cuál es el siguiente paso? Responde SOLO con el nombre del nodo.
-"""
-    try:
-        response = llm.invoke(router_prompt)
-        next_node = response.content.strip().lower().split()[0].replace("`", "").replace("'", "").replace('"', '')
-        state["next_node"] = next_node
-        logger.info(f"Router (LLM): {state['next_node']}")
-    except Exception as e:
-        logger.error(f"Error en router_node: {e}", exc_info=True)
-        state["next_node"] = "consultation"
-        
+    # 6. Por defecto, seguir en consulta
+    state["next_node"] = "consultation"
+    logger.info("Router: Continuando consulta")
     return state
 
-# --- REEMPLAZA consultation_node CON ESTA VERSIÓN MEJORADA ---
 def consultation_node(state: AgentState) -> AgentState:
     """
-    Gestiona la conversación consultiva con el cliente de forma más inteligente.
+    Gestiona la conversación consultiva con el cliente de forma optimizada.
     """
     print("---CONSULTATION NODE---")
     
@@ -155,73 +221,54 @@ def consultation_node(state: AgentState) -> AgentState:
     is_first_interaction = len(messages) <= 2
     last_user_message = state.get('current_message', '')
 
-    if is_first_interaction:
-        system_prompt = """Eres "Sebastián", un asistente de ventas amigable y experto de EquiposUp. Tu propósito es entender la necesidad del cliente para recomendarle la maquinaria de alturas perfecta. Inicia la conversación presentándote cálidamente y haz una pregunta abierta para empezar, como: '¡Hola! Soy Sebastián de EquiposUp. ¿En qué tipo de proyecto o trabajo necesitas ayuda hoy?'"""
-    else:
-        # Extrae el historial para dar contexto, excluyendo el último SystemMessage si existe
-        conversation_history = "\n".join([f"{msg.type}: {msg.content}" for msg in messages if not isinstance(msg, SystemMessage)])
-        system_prompt = f"""Eres "Sebastián", un experto de EquiposUp. Continúa la conversación de forma natural. NO saludes de nuevo. NO repitas la información que el usuario te acaba de dar. Tu objetivo es obtener los detalles que te faltan.
-
-**Historial de la Conversación:**
-{conversation_history}
-
-Basado en el historial, identifica la siguiente pieza de información que necesitas (ej: tipo de superficie, altura requerida, si necesita operario) y haz UNA sola pregunta clara y concisa para obtenerla. Sé breve y ve al grano.
-"""
-    
     try:
-        # Preparamos los mensajes para el LLM
-        llm_messages = [SystemMessage(content=system_prompt)] + messages[-1:]
-        response = llm.invoke(llm_messages)
+        # Extraer información usando método simple primero
+        extracted = extract_info_simple(last_user_message)
         
-        # Extraer información del mensaje actual
-        extraction_prompt = f"""
-Analiza este mensaje del cliente y extrae información relevante en formato JSON:
-"{last_user_message}"
+        # Actualizar estado con los datos extraídos
+        if extracted.get("user_name"): 
+            state["user_name"] = extracted["user_name"]
+        if extracted.get("company_name"): 
+            state["company_name"] = extracted["company_name"]
+        if extracted.get("phone"): 
+            state["phone"] = extracted["phone"]
+        if extracted.get("email"): 
+            state["email"] = extracted["email"]
+        if extracted.get("rut_text"):
+            if "documents" not in state: state["documents"] = {}
+            state["documents"]["rut"] = {"text": extracted["rut_text"], "received": True}
+        
+        if extracted["project_details"]:
+            if "project_details" not in state: 
+                state["project_details"] = {}
+            for key, value in extracted["project_details"].items():
+                if value is not None:
+                    state["project_details"][key] = value
 
-JSON a extraer:
-{{
-  "user_name": "nombre" o null,
-  "company_name": "empresa" o null,
-  "phone": "telefono" o null,
-  "email": "email" o null,
-  "rut_text": "numero de RUT" o null,
-  "project_details": {{
-    "height": numero o null,
-    "duration_text": "duracion" o null,
-    "work_type": "tipo de trabajo" o null
-  }}
-}}
-"""
+        # Generar respuesta basada en lo que falta
+        project_details = state.get('project_details', {})
         
-        # Extraer datos
-        try:
-            extraction_response = llm.invoke(extraction_prompt)
-            extracted = json.loads(extraction_response.content.strip().replace("```json", "").replace("```", ""))
-            
-            # Actualizar estado con los datos extraídos
-            if extracted.get("user_name"): state["user_name"] = extracted["user_name"]
-            if extracted.get("company_name"): state["company_name"] = extracted["company_name"]
-            if extracted.get("phone"): state["phone"] = extracted["phone"]
-            if extracted.get("email"): state["email"] = extracted["email"]
-            if extracted.get("rut_text"):
-                if "documents" not in state: state["documents"] = {}
-                state["documents"]["rut"] = {"text": extracted["rut_text"], "received": True}
-            
-            if "project_details" in extracted and extracted["project_details"]:
-                if "project_details" not in state: state["project_details"] = {}
-                for key, value in extracted["project_details"].items():
-                    if value is not None:
-                        state["project_details"][key] = value
-                        
-        except Exception as e:
-            logger.error(f"Error extrayendo datos: {e}")
+        if is_first_interaction:
+            response_text = generate_response("welcome", {})
+        elif not project_details.get('height'):
+            response_text = "¿A qué altura necesitas trabajar? (en metros o número de pisos)"
+        elif not project_details.get('work_type'):
+            response_text = "¿Qué tipo de trabajo vas a realizar? (limpieza, mantenimiento, construcción, etc.)"
+        elif not project_details.get('duration_text'):
+            response_text = "¿Por cuánto tiempo necesitas el equipo? (días, semanas, meses)"
+        else:
+            # Si tenemos toda la info, confirmar que buscaremos opciones
+            response_text = f"Perfecto, tengo toda la información. Voy a buscar las mejores opciones de equipos para tu trabajo de {project_details.get('work_type')} a {project_details.get('height')}m por {project_details.get('duration_text')}."
         
-        state['response'] = response.content
-        logger.info(f"Consulta procesada. Respuesta: {state['response'][:50]}...")
+        state['response'] = response_text
+        logger.info(f"Consulta procesada exitosamente")
         
     except Exception as e:
-        logger.error(f"Error en consultation_node: {e}", exc_info=True)
-        state['response'] = "Parece que no entendí muy bien. ¿Podrías explicármelo de otra forma, por favor?"
+        logger.error(f"Error en consultation_node: {e}")
+        if "429" in str(e) or "quota" in str(e).lower():
+            state['response'] = generate_response("quota_exceeded", {})
+        else:
+            state['response'] = generate_response("error", {})
     
     return state
 
@@ -298,6 +345,7 @@ También puedo ayudarte con la cotización si alguna te convence. 😊"""
         
         state['response'] = recommendations_text
         state['conversation_stage'] = "equipment_selected"
+        state['selected_equipment'] = recommended_equipment[0]  # Seleccionar el primero por defecto
         
         logger.info("Recomendaciones generadas exitosamente")
         
@@ -311,7 +359,6 @@ def collect_documents_node(state: AgentState) -> AgentState:
     """
     Nodo recolector de documentos. Ahora es más simple y solo se activa
     si el router detecta que, tras pedir la cotización, falta algún dato.
-    La extracción se delega al `consultation_node`.
     """
     
     # NODO DE RECOLECCIÓN SIMPLIFICADO
@@ -333,7 +380,6 @@ def collect_documents_node(state: AgentState) -> AgentState:
     
     return state
 
-# --- AÑADIR ESTE NUEVO NODO MEJORADO ---
 def process_rut_node(state: AgentState) -> AgentState:
     """
     Procesa el archivo RUT (PDF) para extraer la información del cliente.
@@ -371,7 +417,6 @@ def process_rut_node(state: AgentState) -> AgentState:
     
     return state
 
-# --- MODIFICA generate_quotation_node ---
 def generate_quotation_node(state: AgentState) -> AgentState:
     """
     Genera el PDF de la cotización y lo prepara para el envío.
@@ -462,7 +507,6 @@ def generate_quotation_node(state: AgentState) -> AgentState:
         
     return state
 
-# --- MODIFICA send_quotation_node ---
 def send_quotation_node(state: AgentState) -> AgentState:
     """
     Envía la cotización al cliente y notifica al equipo comercial.

@@ -6,6 +6,7 @@ from langchain_core.messages import HumanMessage, AIMessage
 from agent.state import AgentState
 from database.connection import SessionLocal
 from database.models import Conversation, Message
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,6 @@ Para comenzar, simplemente escríbeme contándome sobre tu proyecto. ¡Empecemos
         if user_id in self.active_conversations:
             del self.active_conversations[user_id]
 
-    # --- MODIFICA handle_message PARA USAR EL NUEVO MÉTODO ---
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE, agent_graph):
         """Maneja mensajes de texto, delega toda la lógica al agente."""
         user_id = str(update.effective_user.id)
@@ -52,11 +52,16 @@ Para comenzar, simplemente escríbeme contándome sobre tu proyecto. ¡Empecemos
             
         except Exception as e:
             logger.error(f"Error procesando mensaje: {e}", exc_info=True)
-            await update.message.reply_text(
-                "Disculpa, tuve un problema procesando tu mensaje. ¿Podrías intentar de nuevo?"
-            )
+            # Si hay error de cuota, usar mensaje específico
+            if "429" in str(e) or "quota" in str(e).lower():
+                await update.message.reply_text(
+                    "Disculpa, estoy procesando muchas consultas en este momento. Dame unos minutos y vuelve a intentarlo. 😊"
+                )
+            else:
+                await update.message.reply_text(
+                    "Disculpa, tuve un problema procesando tu mensaje. ¿Podrías intentar de nuevo?"
+                )
 
-    # --- REEMPLAZA TU handle_document CON ESTE ---
     async def handle_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE, agent_graph):
         """
         Gestiona la recepción de documentos (específicamente el RUT en PDF).
@@ -114,34 +119,41 @@ Para comenzar, simplemente escríbeme contándome sobre tu proyecto. ¡Empecemos
             
         except Exception as e:
             logger.error(f"Error procesando documento: {e}", exc_info=True)
-            await update.message.reply_text(
-                "Hubo un problema procesando tu documento. ¿Podrías intentar enviarlo de nuevo?"
-            )
+            if "429" in str(e) or "quota" in str(e).lower():
+                await update.message.reply_text(
+                    "Disculpa, estoy procesando muchas consultas. Dame unos minutos y vuelve a intentar subir el documento. 😊"
+                )
+            else:
+                await update.message.reply_text(
+                    "Hubo un problema procesando tu documento. ¿Podrías intentar enviarlo de nuevo?"
+                )
 
-    # --- CREA ESTE NUEVO MÉTODO AUXILIAR ---
     async def _invoke_agent_and_reply(self, state: AgentState, update: Update, context: ContextTypes.DEFAULT_TYPE, agent_graph):
-        """Método auxiliar que invoca al agente y maneja la respuesta."""
+        """Método auxiliar que invoca al agente y maneja la respuesta con optimización de cuota."""
         user_id = state['user_id']
         
         try:
             # 1. Guardar el mensaje del usuario en la base de datos
             await self._save_message_to_db(user_id, "user", state["current_message"])
             
-            # 2. Ejecutar el grafo del agente con la configuración correcta.
-            config = {"recursion_limit": 25}
+            # 2. Delay preventivo para evitar exceder cuota
+            time.sleep(0.5)
+            
+            # 3. Ejecutar el grafo del agente con la configuración correcta.
+            config = {"recursion_limit": 15}  # Reducido de 25 a 15
             result = agent_graph.invoke(state, config=config)
             
-            # 3. Obtener la respuesta y añadirla al historial.
+            # 4. Obtener la respuesta y añadirla al historial.
             response_text = result.get("response", "Lo siento, no pude procesar tu mensaje.")
             result["messages"].append(AIMessage(content=response_text))
             
-            # 4. Guardar el mensaje del agente en la base de datos
+            # 5. Guardar el mensaje del agente en la base de datos
             await self._save_message_to_db(user_id, "agent", response_text)
             
-            # 5. Actualizar el cache con el estado más reciente.
+            # 6. Actualizar el cache con el estado más reciente.
             self.active_conversations[user_id] = result
             
-            # 6. Lógica para enviar texto o documento
+            # 7. Lógica para enviar texto o documento
             if result.get("response_type") == "document" and result.get("document_to_send"):
                 document_path = result["document_to_send"]
                 caption = result.get("final_message", "Aquí tienes tu cotización.")
@@ -173,7 +185,10 @@ Para comenzar, simplemente escríbeme contándome sobre tu proyecto. ¡Empecemos
                 
         except Exception as e:
             logger.error(f"Error en _invoke_agent_and_reply: {e}", exc_info=True)
-            await update.message.reply_text("Disculpa, tuve un problema procesando tu solicitud.")
+            if "429" in str(e) or "quota" in str(e).lower():
+                await update.message.reply_text("Disculpa, estoy procesando muchas consultas. Dame unos minutos y vuelve a intentarlo. 😊")
+            else:
+                await update.message.reply_text("Disculpa, tuve un problema procesando tu solicitud.")
 
     async def _get_or_create_conversation_state(self, user_id: str, user) -> AgentState:
         """Obtiene el estado del cache, la BD o crea uno nuevo."""
@@ -222,7 +237,16 @@ Para comenzar, simplemente escríbeme contándome sobre tu proyecto. ¡Empecemos
                     ready_for_quotation=False,
                     current_message="",
                     response="",
-                    next_node="consultation"
+                    next_node="consultation",
+                    selected_equipment=None,
+                    quotation_data=None,
+                    document_path=None,
+                    quotation_pdf_path=None,
+                    client_info=None,
+                    nit=None,
+                    response_type="text",
+                    document_to_send=None,
+                    final_message=None
                 )
             else:
                 # Crear nueva conversación en la BD
@@ -251,7 +275,19 @@ Para comenzar, simplemente escríbeme contándome sobre tu proyecto. ¡Empecemos
                     ready_for_quotation=False,
                     current_message="",
                     response="",
-                    next_node="consultation"
+                    next_node="consultation",
+                    company_name=None,
+                    phone=None,
+                    email=None,
+                    selected_equipment=None,
+                    quotation_data=None,
+                    document_path=None,
+                    quotation_pdf_path=None,
+                    client_info=None,
+                    nit=None,
+                    response_type="text",
+                    document_to_send=None,
+                    final_message=None
                 )
             
             return state

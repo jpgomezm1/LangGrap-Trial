@@ -14,9 +14,17 @@ from reportlab.lib.pagesizes import letter
 from reportlab.lib.units import inch
 from datetime import datetime
 from config import config  # Importar config correctamente
+import time
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Configura la API de Gemini usando la configuración centralizada
 genai.configure(api_key=config.GOOGLE_API_KEY)
+
+def rate_limit_delay_gemini():
+    """Delay específico para llamadas de Gemini Vision"""
+    time.sleep(2.0)  # 2 segundos para Vision API
 
 class GetEquipmentArgs(BaseModel):
     """Argumentos para la herramienta GetEquipment"""
@@ -37,24 +45,26 @@ class GetEquipmentTool(BaseTool):
             # Análisis inteligente de la descripción del proyecto
             description_lower = project_description.lower()
             
-            # Determinar categoría automáticamente si no se proporciona
+            # Determinar categoría automáticamente si no se proporciona - CORREGIDO
             if not category:
-                if any(word in description_lower for word in ['pintura', 'mantenimiento', 'limpieza']) and (max_height or 0) <= 3:
+                if any(word in description_lower for word in ['limpieza', 'ventana', 'clean']) and (max_height or 0) >= 10:
+                    category = "elevadores"  # Para limpieza de altura necesita elevador
+                elif any(word in description_lower for word in ['pintura', 'mantenimiento', 'limpieza']) and (max_height or 0) <= 6:
                     category = "escaleras"
                 elif any(word in description_lower for word in ['construcción', 'obra']) and (max_height or 0) <= 8:
                     category = "andamios"
-                elif (max_height or 0) > 8:
-                    category = "elevadores"
+                elif (max_height or 0) > 6:
+                    category = "elevadores"  # Para alturas mayores a 6m usar elevadores
                 else:
-                    category = "andamios"  # Default
+                    category = None  # No filtrar por categoría, mostrar todos
             
-            # Filtrar por categoría
+            # Filtrar por categoría (más flexible) - CORREGIDO
             if category:
                 query = query.filter(Equipment.category.ilike(f"%{category}%"))
             
-            # Filtrar por altura
+            # Filtrar por altura (más flexible - permitir equipos un poco menores) - CORREGIDO
             if max_height:
-                query = query.filter(Equipment.max_height >= max_height)
+                query = query.filter(Equipment.max_height >= max_height * 0.8)  # 80% de la altura mínima
             
             # Ordenar por relevancia (altura y precio)
             query = query.order_by(Equipment.max_height.asc(), Equipment.daily_price.asc())
@@ -196,49 +206,64 @@ class ValidateDocumentTool(BaseTool):
         
         return "Documento válido"
 
-# --- AÑADIR ESTA NUEVA FUNCIÓN MEJORADA ---
 def process_rut_with_gemini(pdf_path: str) -> dict:
     """
     Procesa un archivo PDF (RUT) usando Gemini Vision para extraer información clave.
-    Versión mejorada con mejor manejo de errores y prompt optimizado.
+    Versión optimizada con mejor manejo de errores y control de cuota.
     """
     print(f"🛠️ Procesando RUT desde: {pdf_path}")
     
     try:
-        # Configuración del modelo Gemini Vision con el modelo más actualizado
-        model = genai.GenerativeModel('gemini-1.5-pro-latest')
+        # Rate limiting para evitar exceder cuota
+        rate_limit_delay_gemini()
+        
+        # Configuración del modelo Gemini Vision con configuración optimizada
+        model = genai.GenerativeModel('gemini-1.5-flash')  # Usar flash en lugar de pro para ahorrar cuota
 
-        # Abrir el PDF
+        # Abrir el PDF y tomar solo la primera página para ahorrar tokens
         doc = fitz.open(pdf_path)
         
-        image_parts = []
-        for page_num in range(len(doc)):
-            page = doc.load_page(page_num)
-            pix = page.get_pixmap()
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            image_parts.append(img)
+        # Solo procesar la primera página para ahorrar cuota
+        page = doc.load_page(0)
+        pix = page.get_pixmap()
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        
+        # Prompt optimizado y más corto para ahorrar tokens
+        prompt = """Extrae información del RUT colombiano en JSON:
+{
+  "company_name": "razón social",
+  "nit": "número sin dígito verificación",
+  "address": "dirección",
+  "email": "email si aparece"
+}
+Solo JSON, sin texto extra."""
 
-        # Prompt mejorado para mayor precisión
-        prompt_parts = [
-            "Eres un experto analista de documentos contables de Colombia. Analiza la siguiente imagen de un RUT (Registro Único Tributario) y extrae de forma precisa la siguiente información en formato JSON. Si un campo no está explícitamente presente, usa `null` como valor. Los campos a extraer son: `company_name` (Razón Social), `nit` (Número de Identificación Tributaria, sin el dígito de verificación), `address` (Dirección Principal), `email` (Correo electrónico de notificación judicial o de contacto), y `responsibilities` (lista de responsabilidades tributarias). Devuelve únicamente el JSON, sin texto introductorio ni explicaciones.",
-            *image_parts,
-        ]
-
-        # Llamada al modelo
-        response = model.generate_content(prompt_parts)
+        # Llamada al modelo con configuración optimizada
+        response = model.generate_content([prompt, img])
         
         # Limpieza robusta para evitar errores de JSON
         clean_response = response.text.strip().replace("```json", "").replace("```", "").strip()
+        
+        # Si la respuesta contiene texto extra antes del JSON, extraer solo el JSON
+        if clean_response.find("{") > 0:
+            clean_response = clean_response[clean_response.find("{"):]
+        if clean_response.rfind("}") < len(clean_response) - 1:
+            clean_response = clean_response[:clean_response.rfind("}") + 1]
+        
         client_info = json.loads(clean_response)
         
         print(f"✅ Información del RUT extraída: {client_info}")
         return client_info
 
+    except json.JSONDecodeError as e:
+        print(f"❌ Error decodificando JSON: {e}")
+        return {"error": f"Respuesta del modelo no es JSON válido: {e}"}
     except Exception as e:
         print(f"❌ Error al procesar el RUT con Gemini: {e}")
+        if "429" in str(e) or "quota" in str(e).lower():
+            return {"error": "Cuota excedida. Intenta de nuevo en unos minutos."}
         return {"error": f"No se pudo procesar el documento: {e}"}
 
-# --- AÑADIR ESTA FUNCIÓN MEJORADA ---
 def generate_quotation_pdf(client_info: dict, recommended_equipment: list, quotation_data: dict = None, project_details: dict = None, quotation_id: str = None) -> str:
     """
     Genera un archivo PDF profesional para la cotización con diseño mejorado.
@@ -258,7 +283,10 @@ def generate_quotation_pdf(client_info: dict, recommended_equipment: list, quota
         # --- Cabecera Mejorada ---
         # Logo si existe
         if os.path.exists("assets/logo.png"):
-            c.drawImage("assets/logo.png", 50, height - 100, width=150, preserveAspectRatio=True)
+            try:
+                c.drawImage("assets/logo.png", 50, height - 100, width=150, preserveAspectRatio=True)
+            except:
+                pass  # Si no puede cargar el logo, continuar sin él
         
         # Información de la empresa
         c.setFont("Helvetica-Bold", 18)
@@ -385,6 +413,7 @@ def generate_quotation_pdf(client_info: dict, recommended_equipment: list, quota
     
     except Exception as e:
         print(f"❌ Error generando el PDF de la cotización: {e}")
+        logger.error(f"Error generando PDF: {e}")
         return None
 
 def get_agent_tools():
