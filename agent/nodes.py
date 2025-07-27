@@ -6,7 +6,6 @@ from services.email_service import EmailService
 from config import config
 import json
 import logging
-import asyncio
 
 logger = logging.getLogger(__name__)
 
@@ -21,10 +20,10 @@ llm = ChatGoogleGenerativeAI(
 # Inicializar servicio de email
 email_service = EmailService()
 
-def welcome_node(state: AgentState) -> AgentState:
-    """Nodo de bienvenida e inicialización"""
-    
-    welcome_message = f"""¡Hola! Soy el asistente virtual de {config.COMPANY_NAME} 👋
+def generate_response(template_name: str, context: dict) -> str:
+    """Función utilitaria para generar respuestas consistentes"""
+    templates = {
+        "welcome": f"""¡Hola! Soy el asistente virtual de {config.COMPANY_NAME} 👋
 
 Estoy aquí para ayudarte a encontrar el equipo de altura perfecto para tu proyecto y generar una cotización personalizada.
 
@@ -33,132 +32,214 @@ Para empezar, me gustaría conocerte un poco mejor. ¿Podrías contarme:
 - ¿De qué empresa eres?
 - ¿En qué tipo de proyecto vas a trabajar?
 
-¡Cuéntame todo lo que consideres relevante! 😊"""
+¡Cuéntame todo lo que consideres relevante! 😊""",
+        
+        "clarification": """No estoy seguro de entender completamente tu solicitud. ¿Podrías ayudarme proporcionando más detalles sobre:
+
+- ¿Qué altura necesitas alcanzar?
+- ¿Qué tipo de trabajo vas a realizar?
+- ¿Por cuánto tiempo necesitas el equipo?
+
+Esto me ayudará a recomendarte la mejor opción. 😊""",
+        
+        "missing_documents": """¡Perfecto! Me alegra que te interesen nuestros equipos. 
+
+Para generar tu cotización oficial necesito algunos datos adicionales:
+
+{missing_items}
+
+Puedes enviarme el RUT como foto del documento o simplemente escribir el número. Para el teléfono y email, solo escríbelos en el mensaje.
+
+¿Con cuál prefieres empezar? 😊""",
+        
+        "error": "Disculpa, tuve un problema procesando tu solicitud. ¿Podrías intentar de nuevo con más detalles?"
+    }
     
-    # Actualizar estado
+    template = templates.get(template_name, templates["error"])
+    return template.format(**context) if context else template
+
+def router_node(state: AgentState) -> AgentState:
+    """Nodo central de enrutamiento que decide el siguiente paso usando LLM"""
+    
+    router_prompt = f"""Eres el router central de un asistente de ventas de equipos de altura. Analiza el estado actual de la conversación y decide cuál debe ser el siguiente paso.
+
+ESTADO ACTUAL:
+- Etapa: {state.get('conversation_stage', 'unknown')}
+- Tiene nombre: {'Sí' if state.get('user_name') else 'No'}
+- Tiene empresa: {'Sí' if state.get('company_name') else 'No'}
+- Tiene teléfono: {'Sí' if state.get('phone') else 'No'}
+- Tiene email: {'Sí' if state.get('email') else 'No'}
+- Tiene altura: {'Sí' if state.get('project_details', {}).get('height') else 'No'}
+- Tiene duración: {'Sí' if state.get('project_details', {}).get('duration_text') else 'No'}
+- Tiene equipos recomendados: {'Sí' if state.get('recommended_equipment') else 'No'}
+- Tiene documentos RUT: {'Sí' if state.get('documents', {}).get('rut') else 'No'}
+- Cotización generada: {'Sí' if state.get('quotation_data') else 'No'}
+
+ÚLTIMO MENSAJE: {state.get('current_message', '')}
+
+OPCIONES DISPONIBLES:
+- consultation: Si necesita más información del proyecto o datos del cliente
+- analyze_requirements: Si tiene info básica del proyecto pero no ha analizado equipos
+- recommend_equipment: Si necesita recomendar o cambiar equipos
+- collect_documents: Si tiene equipos seleccionados pero faltan documentos
+- generate_quotation: Si tiene todo listo para cotizar
+- send_quotation: Si la cotización está generada pero no enviada
+- notify_commercial: Si todo está completo
+- END: Si la conversación ha terminado completamente
+
+Responde SOLO con una de las opciones exactas de arriba."""
+
+    try:
+        response = llm.invoke([{"role": "user", "content": router_prompt}])
+        next_node = response.content.strip().lower()
+        
+        # Validar que la respuesta sea válida
+        valid_nodes = ["consultation", "analyze_requirements", "recommend_equipment", 
+                      "collect_documents", "generate_quotation", "send_quotation", 
+                      "notify_commercial", "end"]
+        
+        if next_node not in valid_nodes:
+            # Fallback: decidir basado en reglas simples
+            if not state.get('project_details', {}).get('height'):
+                next_node = "consultation"
+            elif not state.get('recommended_equipment'):
+                next_node = "analyze_requirements"
+            elif not state.get('documents', {}).get('rut'):
+                next_node = "collect_documents"
+            elif not state.get('quotation_data'):
+                next_node = "generate_quotation"
+            else:
+                next_node = "notify_commercial"
+        
+        state["next_node"] = next_node.upper() if next_node == "end" else next_node
+        
+        logger.info(f"Router decidió: {state['next_node']}")
+        
+    except Exception as e:
+        logger.error(f"Error en router_node: {e}")
+        # Fallback conservador
+        state["next_node"] = "consultation"
+    
+    return state
+
+def welcome_node(state: AgentState) -> AgentState:
+    """Nodo de bienvenida e inicialización"""
+    
     state["conversation_stage"] = "gathering_info"
-    state["response"] = welcome_message
+    state["response"] = generate_response("welcome", {})
     state["needs_more_info"] = True
+    state["next_node"] = "consultation"
     
     return state
 
 def consultation_node(state: AgentState) -> AgentState:
-    """Nodo consultor de necesidades"""
+    """Nodo consultor de necesidades con extracción de datos estructurados"""
     
-    system_prompt = f"""Eres un consultor experto en equipos de altura de {config.COMPANY_NAME}. Tu objetivo es entender completamente las necesidades del cliente de manera natural y conversacional.
+    system_prompt = f"""Eres un consultor experto en equipos de altura de {config.COMPANY_NAME}. Analiza el mensaje del cliente y extrae información estructurada.
 
-Información actual del cliente:
+INFORMACIÓN ACTUAL:
 - Nombre: {state.get('user_name', 'No proporcionado')}
 - Empresa: {state.get('company_name', 'No proporcionada')}
+- Teléfono: {state.get('phone', 'No proporcionado')}
+- Email: {state.get('email', 'No proporcionado')}
 - Detalles del proyecto: {json.dumps(state.get('project_details', {}), ensure_ascii=False)}
 
-INSTRUCCIONES:
-1. Haz preguntas abiertas y naturales, como si fueras un consultor humano experto
-2. Enfócate en entender: tipo de trabajo, altura necesaria, duración del alquiler, ubicación, experiencia previa
-3. Identifica el nivel de experiencia del cliente para recomendar equipos apropiados
-4. Si el cliente ya proporcionó información, no la vuelvas a preguntar
-5. Una vez que tengas suficiente información para hacer una recomendación, indica que procederás con las recomendaciones
+MENSAJE DEL CLIENTE: {state['current_message']}
 
-Mensaje del cliente: {state['current_message']}
+TAREAS:
+1. Responde de manera conversacional y profesional
+2. Extrae la siguiente información si está disponible en el mensaje:
+   - height: altura en metros (solo número)
+   - duration_text: duración original como aparece en el mensaje
+   - duration_number: número de días/semanas/meses
+   - work_type: tipo de trabajo (construcción, mantenimiento, pintura, etc.)
+   - user_name: nombre de la persona
+   - company_name: nombre de la empresa
+   - phone: número de teléfono
+   - email: email
 
-Responde de manera conversacional y profesional en español."""
-    
+FORMATO DE RESPUESTA:
+Responde con un JSON que contenga:
+{{
+    "response": "tu respuesta conversacional aquí",
+    "extracted_data": {{
+        "height": número o null,
+        "duration_text": "texto" o null,
+        "duration_number": número o null,
+        "work_type": "tipo" o null,
+        "user_name": "nombre" o null,
+        "company_name": "empresa" o null,
+        "phone": "teléfono" o null,
+        "email": "email" o null
+    }},
+    "has_sufficient_info": true/false
+}}
+
+Marca has_sufficient_info como true solo si tienes altura, duración, tipo de trabajo y nombre del cliente."""
+
     try:
-        response = llm.invoke([{"role": "system", "content": system_prompt}, {"role": "user", "content": state['current_message']}])
+        response = llm.invoke([{"role": "user", "content": system_prompt}])
         
-        # Extraer información del mensaje del cliente
+        # Intentar parsear JSON del LLM
+        try:
+            result = json.loads(response.content)
+        except:
+            # Fallback si el LLM no devuelve JSON válido
+            result = {
+                "response": "Entiendo tu consulta. ¿Podrías contarme un poco más sobre la altura que necesitas alcanzar y por cuánto tiempo sería el alquiler?",
+                "extracted_data": {},
+                "has_sufficient_info": False
+            }
+        
+        # Actualizar estado con datos extraídos
+        extracted = result.get("extracted_data", {})
         project_details = state.get('project_details', {})
         
-        # Extracción básica de información
-        message_lower = state['current_message'].lower()
-        
-        # Extraer altura
-        import re
-        height_patterns = [
-            r'(\d+)\s*metros?',
-            r'(\d+)\s*m\b',
-            r'altura.*?(\d+)',
-            r'(\d+).*?altura'
-        ]
-        
-        for pattern in height_patterns:
-            height_match = re.search(pattern, message_lower)
-            if height_match:
-                try:
-                    height = int(height_match.group(1))
-                    if 1 <= height <= 50:  # Rango razonable
-                        project_details['height'] = height
-                        break
-                except ValueError:
-                    continue
-        
-        # Extraer duración
-        duration_patterns = [
-            r'(\d+)\s*días?',
-            r'(\d+)\s*semanas?',
-            r'(\d+)\s*meses?',
-            r'por\s*(\d+)'
-        ]
-        
-        for pattern in duration_patterns:
-            duration_match = re.search(pattern, message_lower)
-            if duration_match:
-                project_details['duration_text'] = duration_match.group(0)
-                project_details['duration_number'] = int(duration_match.group(1))
-                break
-        
-        # Extraer tipo de trabajo
-        work_types = ['construcción', 'mantenimiento', 'pintura', 'limpieza', 'instalación', 'reparación']
-        for work_type in work_types:
-            if work_type in message_lower:
-                project_details['work_type'] = work_type
-                break
-        
-        # Determinar si tenemos suficiente información
-        has_sufficient_info = (
-            'height' in project_details and 
-            ('duration_text' in project_details or 'duration_number' in project_details) and
-            state.get('user_name') and
-            ('work_type' in project_details or any(word in message_lower for word in ['proyecto', 'trabajo', 'obra', 'construcción']))
-        )
+        for key, value in extracted.items():
+            if value is not None:
+                if key in ['height', 'duration_text', 'duration_number', 'work_type']:
+                    project_details[key] = value
+                else:
+                    state[key] = value
         
         state['project_details'] = project_details
-        state['response'] = response.content
-        state['needs_more_info'] = not has_sufficient_info
+        state['response'] = result.get("response", "¿Podrías contarme más detalles sobre tu proyecto?")
+        state['needs_more_info'] = not result.get("has_sufficient_info", False)
         
-        if has_sufficient_info:
+        if not state['needs_more_info']:
             state['conversation_stage'] = "analyzing_requirements"
         
-        logger.info(f"Consulta procesada - Info suficiente: {has_sufficient_info}")
+        logger.info(f"Consulta procesada - Info suficiente: {not state['needs_more_info']}")
         
     except Exception as e:
         logger.error(f"Error en consultation_node: {e}")
-        state['response'] = "Entiendo tu consulta. ¿Podrías contarme un poco más sobre la altura que necesitas alcanzar y por cuánto tiempo sería el alquiler?"
+        state['response'] = generate_response("clarification", {})
+        state['needs_more_info'] = True
     
     return state
 
 def analyze_requirements_node(state: AgentState) -> AgentState:
-    """Nodo analizador de requerimientos"""
+    """Nodo analizador de requerimientos con herramienta inteligente"""
     
     try:
         project_details = state.get('project_details', {})
-        height = project_details.get('height', 5)  # Default 5m
         
-        # Determinar categoría de equipo necesario
-        if height <= 3:
-            category = "escaleras"
-        elif height <= 8:
-            category = "andamios"
-        elif height <= 15:
-            category = "elevadores"
-        else:
-            category = "equipos_especializados"
+        # Crear descripción del proyecto para la herramienta
+        project_description = f"""
+        Altura necesaria: {project_details.get('height', 'No especificada')} metros
+        Tipo de trabajo: {project_details.get('work_type', 'General')}
+        Duración: {project_details.get('duration_text', 'No especificada')}
+        """
         
-        # Buscar equipos apropiados
+        # Usar herramienta mejorada
         from agent.tools import GetEquipmentTool
         equipment_tool = GetEquipmentTool()
         
-        equipment_data = equipment_tool._run(category=category, max_height=height)
+        # Llamar con descripción del proyecto
+        equipment_data = equipment_tool._run(
+            project_description=project_description.strip(),
+            max_height=project_details.get('height', 10)
+        )
         equipment_list = json.loads(equipment_data)
         
         # Tomar las mejores 3 opciones
@@ -170,6 +251,7 @@ def analyze_requirements_node(state: AgentState) -> AgentState:
     except Exception as e:
         logger.error(f"Error en analyze_requirements_node: {e}")
         state['recommended_equipment'] = []
+        state['response'] = "Hubo un problema analizando tu proyecto. ¿Podrías proporcionarme los detalles nuevamente?"
     
     return state
 
@@ -214,7 +296,7 @@ También puedo ayudarte con la cotización si alguna te convence. 😊"""
         
     except Exception as e:
         logger.error(f"Error en recommend_equipment_node: {e}")
-        state['response'] = "Hubo un problema generando las recomendaciones. ¿Podrías contarme de nuevo sobre tu proyecto?"
+        state['response'] = generate_response("error", {})
     
     return state
 
@@ -235,20 +317,12 @@ def collect_documents_node(state: AgentState) -> AgentState:
         missing_items.append("📧 Email de contacto")
     
     if missing_items:
-        message = f"""¡Perfecto! Me alegra que te interesen nuestros equipos. 
-
-Para generar tu cotización oficial necesito algunos datos adicionales:
-
-{chr(10).join(['• ' + item for item in missing_items])}
-
-Puedes enviarme el RUT como foto del documento o simplemente escribir el número. Para el teléfono y email, solo escríbelos en el mensaje.
-
-¿Con cuál prefieres empezar? 😊"""
+        missing_text = "\n".join(['• ' + item for item in missing_items])
+        state['response'] = generate_response("missing_documents", {"missing_items": missing_text})
     else:
-        message = "¡Excelente! Ya tengo toda la información necesaria. Procediendo a generar tu cotización..."
+        state['response'] = "¡Excelente! Ya tengo toda la información necesaria. Procediendo a generar tu cotización..."
         state['conversation_stage'] = "ready_for_quotation"
     
-    state['response'] = message
     return state
 
 def generate_quotation_node(state: AgentState) -> AgentState:
@@ -325,7 +399,7 @@ def generate_quotation_node(state: AgentState) -> AgentState:
         
     except Exception as e:
         logger.error(f"Error generando cotización: {e}")
-        state['response'] = "Hubo un problema generando la cotización. Nuestro equipo se pondrá en contacto contigo para resolverlo."
+        state['response'] = generate_response("error", {})
     
     return state
 
@@ -363,7 +437,6 @@ def notify_commercial_node(state: AgentState) -> AgentState:
     """Nodo notificador comercial"""
     
     try:
-        # Por ahora solo logueamos que debería enviarse la notificación
         logger.info(f"Cotización completada para usuario {state.get('user_id')} - {state.get('company_name')}")
         
         state['commercial_notified'] = True

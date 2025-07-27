@@ -36,3 +36,6 @@ class AgentState(TypedDict):
     
     # Respuesta a enviar
     response: str
+    
+    # Campo para el router centralizado
+    next_node: str

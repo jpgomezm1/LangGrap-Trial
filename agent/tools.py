@@ -6,25 +6,48 @@ from database.connection import SessionLocal
 from database.models import Equipment, Conversation, Quotation
 import json
 
+class GetEquipmentArgs(BaseModel):
+    """Argumentos para la herramienta GetEquipment"""
+    project_description: str = Field(description="Descripción completa del proyecto incluyendo altura, tipo de trabajo y duración")
+    max_height: Optional[float] = Field(default=None, description="Altura máxima requerida en metros")
+    category: Optional[str] = Field(default=None, description="Categoría específica de equipo si se conoce")
+
 class GetEquipmentTool(BaseTool):
     name = "get_equipment"
-    description = "Obtiene información sobre equipos disponibles basado en criterios específicos"
+    description = "Obtiene información sobre equipos disponibles basado en la descripción del proyecto"
+    args_schema: Type[BaseModel] = GetEquipmentArgs
     
-    def _run(self, category: str = None, max_height: float = None, use_case: str = None) -> str:
+    def _run(self, project_description: str = "", max_height: float = None, category: str = None) -> str:
         db = SessionLocal()
         try:
             query = db.query(Equipment).filter(Equipment.available == True)
             
+            # Análisis inteligente de la descripción del proyecto
+            description_lower = project_description.lower()
+            
+            # Determinar categoría automáticamente si no se proporciona
+            if not category:
+                if any(word in description_lower for word in ['pintura', 'mantenimiento', 'limpieza']) and (max_height or 0) <= 3:
+                    category = "escaleras"
+                elif any(word in description_lower for word in ['construcción', 'obra']) and (max_height or 0) <= 8:
+                    category = "andamios"
+                elif (max_height or 0) > 8:
+                    category = "elevadores"
+                else:
+                    category = "andamios"  # Default
+            
+            # Filtrar por categoría
             if category:
                 query = query.filter(Equipment.category.ilike(f"%{category}%"))
             
+            # Filtrar por altura
             if max_height:
                 query = query.filter(Equipment.max_height >= max_height)
             
-            if use_case:
-                query = query.filter(Equipment.use_cases.contains([use_case]))
+            # Ordenar por relevancia (altura y precio)
+            query = query.order_by(Equipment.max_height.asc(), Equipment.daily_price.asc())
             
-            equipment = query.all()
+            equipment = query.limit(5).all()  # Limitar a 5 mejores opciones
             
             result = []
             for eq in equipment:
@@ -47,9 +70,15 @@ class GetEquipmentTool(BaseTool):
         finally:
             db.close()
 
+class SaveConversationArgs(BaseModel):
+    """Argumentos para guardar conversación"""
+    user_id: str = Field(description="ID único del usuario")
+    conversation_data: Dict[str, Any] = Field(description="Datos de la conversación a guardar")
+
 class SaveConversationTool(BaseTool):
     name = "save_conversation"
     description = "Guarda o actualiza el estado de la conversación en la base de datos"
+    args_schema: Type[BaseModel] = SaveConversationArgs
     
     def _run(self, user_id: str, conversation_data: Dict[str, Any]) -> str:
         db = SessionLocal()
@@ -77,9 +106,15 @@ class SaveConversationTool(BaseTool):
         finally:
             db.close()
 
+class CalculateQuotationArgs(BaseModel):
+    """Argumentos para calcular cotización"""
+    equipment_ids: List[int] = Field(description="Lista de IDs de equipos para cotizar")
+    rental_days: int = Field(description="Número de días de alquiler")
+
 class CalculateQuotationTool(BaseTool):
     name = "calculate_quotation"
     description = "Calcula el precio total de una cotización basada en equipos y duración"
+    args_schema: Type[BaseModel] = CalculateQuotationArgs
     
     def _run(self, equipment_ids: List[int], rental_days: int) -> str:
         db = SessionLocal()
@@ -90,7 +125,7 @@ class CalculateQuotationTool(BaseTool):
             for eq_id in equipment_ids:
                 equipment = db.query(Equipment).filter(Equipment.id == eq_id).first()
                 if equipment:
-                    # Calcular precio basado en duración
+                    # Calcular precio basado en duración con lógica mejorada
                     if rental_days >= 30 and equipment.monthly_price:
                         months = rental_days // 30
                         remaining_days = rental_days % 30
@@ -125,21 +160,32 @@ class CalculateQuotationTool(BaseTool):
         finally:
             db.close()
 
+class ValidateDocumentArgs(BaseModel):
+    """Argumentos para validar documento"""
+    document_text: str = Field(description="Texto del documento a validar")
+
 class ValidateDocumentTool(BaseTool):
     name = "validate_document"
     description = "Valida que un documento RUT tenga el formato correcto"
+    args_schema: Type[BaseModel] = ValidateDocumentArgs
     
     def _run(self, document_text: str) -> str:
         # Validación básica de RUT colombiano
-        if len(document_text.strip()) < 8:
+        clean_text = document_text.strip()
+        
+        if len(clean_text) < 8:
             return "El RUT debe tener al menos 8 dígitos"
         
-        if not document_text.strip().isdigit():
-            return "El RUT debe contener solo números"
+        if not clean_text.replace('-', '').isdigit():
+            return "El RUT debe contener solo números y guiones"
+        
+        if len(clean_text) > 15:
+            return "El RUT no puede tener más de 15 caracteres"
         
         return "Documento válido"
 
 def get_agent_tools():
+    """Retorna lista de herramientas disponibles para el agente"""
     return [
         GetEquipmentTool(),
         SaveConversationTool(),

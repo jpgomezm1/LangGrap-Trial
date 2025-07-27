@@ -100,14 +100,14 @@ class TelegramAgentBot:
         try:
             logger.info("Iniciando bot de Telegram...")
             
-            # Verificar configuración
-            if not config.TELEGRAM_BOT_TOKEN:
-                raise ValueError("TELEGRAM_BOT_TOKEN no configurado")
+            # Verificar configuración - CORREGIDO: usar TELEGRAM_TOKEN
+            if not config.TELEGRAM_TOKEN:
+                raise ValueError("TELEGRAM_TOKEN no configurado")
             if not config.GOOGLE_API_KEY:
                 raise ValueError("GOOGLE_API_KEY no configurado")
             
-            # Crear aplicación de Telegram
-            application = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
+            # Crear aplicación de Telegram - CORREGIDO: usar TELEGRAM_TOKEN
+            application = Application.builder().token(config.TELEGRAM_TOKEN).build()
             
             # Agregar handlers
             application.add_handler(CommandHandler("start", self.start_command))
@@ -119,7 +119,7 @@ class TelegramAgentBot:
             
             logger.info("Bot configurado correctamente")
             logger.info(f"Bot iniciado - Empresa: {config.COMPANY_NAME}")
-            logger.info(f"URL de la empresa: {config.COMPANY_WEBSITE}")
+            # CORREGIDO: eliminar referencia a COMPANY_WEBSITE que no existe en config
             
             # Ejecutar el bot
             application.run_polling(
