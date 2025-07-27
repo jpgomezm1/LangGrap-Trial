@@ -1,0 +1,14 @@
+python-telegram-bot==20.7
+langgraph==0.2.16
+langchain==0.2.16
+langchain-google-genai==1.0.10
+langchain-community==0.2.16
+psycopg2-binary==2.9.9
+sqlalchemy==2.0.23
+alembic==1.13.1
+pydantic==2.5.2
+python-dotenv==1.0.0
+resend==0.7.0
+aiofiles==23.2.1
+asyncio==3.4.3
+typing-extensions==4.8.0
